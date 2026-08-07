@@ -115,26 +115,29 @@ try {
     ['- [x] ~~Acme Corp | Data Engineer~~ — oferta nieaktywna', null, 'expired entry without a URL'],
   ];
 
-  const pipelinePath = join(SANDBOX, 'pipeline.md');
-  writeFileSync(pipelinePath, SHAPES.map(([line]) => line).join('\n') + '\n');
-
   // scan.mjs resolves its dedupe sources once, at import time, and test-all.mjs
   // imports every suite into one process — so the env override has to be set for
   // a fresh child rather than for this one. cwd is pinned to the sandbox too:
   // applications.md is the one source with no env override, and it resolves
   // against cwd, so this never reads the developer's real tracker.
-  const driver = `import(${JSON.stringify(pathToFileURL(join(ROOT, 'scan.mjs')).href)})`
-    + `.then(m => console.log(JSON.stringify([...m.loadSeenUrls().seen])))`;
-  const seen = new Set(JSON.parse(execFileSync(NODE, ['--input-type=module', '-e', driver], {
-    cwd: SANDBOX,
-    env: {
-      ...process.env,
-      CAREER_OPS_PIPELINE: pipelinePath,
-      CAREER_OPS_SCAN_HISTORY: join(SANDBOX, 'scan-history.tsv'),
-    },
-    encoding: 'utf-8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })));
+  const seenUrlsFor = (pipelineText) => {
+    const pipelinePath = join(SANDBOX, 'pipeline.md');
+    writeFileSync(pipelinePath, pipelineText);
+    const driver = `import(${JSON.stringify(pathToFileURL(join(ROOT, 'scan.mjs')).href)})`
+      + `.then(m => console.log(JSON.stringify([...m.loadSeenUrls().seen])))`;
+    return new Set(JSON.parse(execFileSync(NODE, ['--input-type=module', '-e', driver], {
+      cwd: SANDBOX,
+      env: {
+        ...process.env,
+        CAREER_OPS_PIPELINE: pipelinePath,
+        CAREER_OPS_SCAN_HISTORY: join(SANDBOX, 'scan-history.tsv'),
+      },
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })));
+  };
+
+  const seen = seenUrlsFor(SHAPES.map(([line]) => line).join('\n') + '\n');
 
   for (const [, url, label] of SHAPES) {
     if (!url) continue;
@@ -147,6 +150,23 @@ try {
   const expected = SHAPES.filter(([, url]) => url).length;
   if (seen.size === expected) pass(`pipeline.md: ${expected} URL-bearing shapes seed exactly ${expected} keys`);
   else fail(`expected ${expected} keys, got ${seen.size}: [${[...seen].join(', ')}]`);
+
+  // Where the checkbox may sit. Matching the URL anywhere in the line only works
+  // if the checkbox itself is anchored: pipeline.md is hand-edited, and a note
+  // that merely contains checkbox syntax must not seed the link it mentions —
+  // a false dedupe hides a live posting, which is the costlier direction of
+  // error. Indented entries still count, as they did when the URL had to sit
+  // immediately after the checkbox.
+  const prose = 'Reminder: - [ ] chase the recruiter, posting is https://jobs.example.com/posting/9 (still open)';
+  if (seenUrlsFor(prose + '\n').size === 0) pass('pipeline.md: mid-line checkbox syntax in prose seeds nothing');
+  else fail(`prose line seeded a URL: [${[...seenUrlsFor(prose + '\n')].join(', ')}]`);
+
+  const indented = '  - [ ] https://jobs.example.com/posting/10 | Acme Corp | Staff Engineer';
+  if (seenUrlsFor(indented + '\n').has(normalizeUrlForDedup('https://jobs.example.com/posting/10'))) {
+    pass('pipeline.md: an indented entry still reaches the URL gate');
+  } else {
+    fail('indented entry did not reach the URL gate');
+  }
 } catch (err) {
   fail(`scan.mjs loadSeenUrls tests crashed: ${err && err.message}`);
 } finally {

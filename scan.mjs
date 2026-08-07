@@ -1032,11 +1032,23 @@ export function normalizeUrlForDedup(url) {
  * Only ` ` and `x` are recognized, matching the pre-existing gates: `- [!]`
  * marks a URL that could not be fetched, which is not evidence a posting was
  * surfaced.
+ *
+ * Anchored, because the URL it guards is then matched anywhere in the line: a
+ * hand-written note that happens to contain checkbox syntax mid-sentence and a
+ * link would otherwise seed that link and silently bury a live posting. Leading
+ * whitespace is tolerated so an indented entry still dedupes, as it did when the
+ * URL had to sit immediately after the checkbox.
  */
-const PIPELINE_CHECKBOX_RE = /- \[[ x]\]\s+/;
+const PIPELINE_CHECKBOX_RE = /^\s*- \[[ x]\]\s+/;
 
-/** As `PIPELINE_CHECKBOX_RE`, anchored — used where the old gate anchored too. */
-const PIPELINE_CHECKBOX_ANCHORED_RE = /^- \[[ x]\]\s+/;
+/**
+ * As `PIPELINE_CHECKBOX_RE`, but rejecting indentation.
+ *
+ * The company/role gate stays exactly as strict as the `^- \[` anchor it
+ * replaces: widening it would seed *more* role keys, and one role key suppresses
+ * every other posting that shares it.
+ */
+const PIPELINE_CHECKBOX_STRICT_RE = /^- \[[ x]\]\s+/;
 
 /**
  * A URL sitting anywhere inside a pipeline line.
@@ -1087,10 +1099,10 @@ function extractPipelineUrl(line) {
  *   line has none to contribute.
  */
 function extractPipelineCompanyRole(line) {
-  if (!PIPELINE_CHECKBOX_ANCHORED_RE.test(line)) return null;
+  if (!PIPELINE_CHECKBOX_STRICT_RE.test(line)) return null;
   if (line.includes('~~')) return null;
 
-  const cells = line.replace(PIPELINE_CHECKBOX_ANCHORED_RE, '').split('|').map(cell => cell.trim());
+  const cells = line.replace(PIPELINE_CHECKBOX_STRICT_RE, '').split('|').map(cell => cell.trim());
   if (cells[0].startsWith('#--')) return null;
 
   const urlIndex = cells.findIndex(cell => PIPELINE_URL_RE.test(cell));
