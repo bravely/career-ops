@@ -141,6 +141,22 @@ const KEY = companyRoleDedupKey('Anduril', 'Strategic Finance');
     }
   }
 
+  // Strikethrough is read at the entry boundary, not line-wide. A documented
+  // `note:` column may carry its own `~~…~~`, and a whole-line check would strip
+  // that live entry of its pair — re-opening the duplicate-resurfacing this PR
+  // exists to close.
+  {
+    const noted = sandbox({
+      pipeline: '- [ ] https://ex.com/n/1 | Anduril | Data Engineer | note: replaces ~~old req~~\n',
+    });
+    if (seenFor(noted).has(companyRoleDedupKey('Anduril', 'Data Engineer'))) {
+      pass('pipeline.md: a `note:` column containing ~~strikethrough~~ still seeds a live pair');
+    } else {
+      fail('a live entry lost its pair because a trailing note contained ~~strikethrough~~');
+    }
+    rmSync(noted.dir, { recursive: true, force: true });
+  }
+
   // The negative half matters as much as the positive one: a fix that parsed all
   // six shapes uniformly would let a dead posting bury a live req.
   const live = SHAPES.filter(([, e]) => e).map(([, e]) => companyRoleDedupKey(...e));

@@ -6,12 +6,16 @@
 //
 // 1. `normalizeUrlForDedup` — the *value*: two spellings of one posting must
 //    produce one key, and two postings must never collapse onto one.
-// 2. `loadSeenUrls` over pipeline.md — the *shape*: six line shapes are
+// 2. `collectSeenUrls` over pipeline.md — the *shape*: six line shapes are
 //    documented across the modes, and only the one `appendToPipeline` writes
 //    leads with the URL. Anchoring the match to the checkbox found that one and
 //    missed the rest, so a posting already sitting in the inbox under any other
 //    shape was re-added on the next scan. These tests previously covered only
 //    part 1, which is how five documented shapes drifted out of support unnoticed.
+//
+// Both halves guard the same asymmetry: a missed key re-adds a duplicate, but a
+// *wrong* key silently hides a real job. Every boundary below — which characters
+// end a URL, where the checkbox may sit — is pinned in the hiding direction.
 //
 // StepStone regenerates its `rltr` parameter on every request, so a dedup key that
 // keeps it treats the same posting as new on each scan (one Vonovia posting was
@@ -22,12 +26,10 @@
 // is asymmetric: an unstripped param leaves a visible duplicate, while stripping an
 // identity-bearing one (Greenhouse's `gh_jid`) silently hides a real job. These
 // tests pin both sides of that line.
-import { pass, fail, ROOT, NODE } from './helpers.mjs';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
+import { pass, fail, ROOT } from './helpers.mjs';
 import { join } from 'path';
-import { execFileSync } from 'child_process';
 import { pathToFileURL } from 'url';
+import { collectSeenUrls } from '../scan.mjs';
 
 console.log('\nscan.mjs — normalizeUrlForDedup() ignores tracking params, preserves identity');
 try {
@@ -85,8 +87,7 @@ try {
   fail(`scan.mjs normalizeUrlForDedup tests crashed: ${err && err.message}`);
 }
 
-console.log('\nscan.mjs — loadSeenUrls() finds the URL in every documented pipeline.md shape');
-const SANDBOX = mkdtempSync(join(tmpdir(), 'co-urlshape-'));
+console.log('\nscan.mjs — collectSeenUrls() finds the URL in every documented pipeline.md shape');
 try {
   const { normalizeUrlForDedup } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
 
@@ -115,27 +116,9 @@ try {
     ['- [x] ~~Acme Corp | Data Engineer~~ — oferta nieaktywna', null, 'expired entry without a URL'],
   ];
 
-  // scan.mjs resolves its dedupe sources once, at import time, and test-all.mjs
-  // imports every suite into one process — so the env override has to be set for
-  // a fresh child rather than for this one. cwd is pinned to the sandbox too:
-  // applications.md is the one source with no env override, and it resolves
-  // against cwd, so this never reads the developer's real tracker.
-  const seenUrlsFor = (pipelineText) => {
-    const pipelinePath = join(SANDBOX, 'pipeline.md');
-    writeFileSync(pipelinePath, pipelineText);
-    const driver = `import(${JSON.stringify(pathToFileURL(join(ROOT, 'scan.mjs')).href)})`
-      + `.then(m => console.log(JSON.stringify([...m.loadSeenUrls().seen])))`;
-    return new Set(JSON.parse(execFileSync(NODE, ['--input-type=module', '-e', driver], {
-      cwd: SANDBOX,
-      env: {
-        ...process.env,
-        CAREER_OPS_PIPELINE: pipelinePath,
-        CAREER_OPS_SCAN_HISTORY: join(SANDBOX, 'scan-history.tsv'),
-      },
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })));
-  };
+  // `collectSeenUrls` takes the source texts directly (#2382), so pipeline.md
+  // parsing is testable without touching the filesystem at all.
+  const seenUrlsFor = (pipelineText) => collectSeenUrls({ pipelineText }).seen;
 
   const seen = seenUrlsFor(SHAPES.map(([line]) => line).join('\n') + '\n');
 
@@ -167,8 +150,22 @@ try {
   } else {
     fail('indented entry did not reach the URL gate');
   }
+
+  // Where the URL may END. Only whitespace and `|` terminate it: `|` cannot
+  // appear unencoded in a URL and is this format's separator. Excluding any
+  // legal URL character instead truncates the key, which is the expensive
+  // direction twice over — the entry stops deduping, *and* the truncated prefix
+  // enters the seen-set, so every other posting on that host false-dedupes
+  // against it. `~` is RFC 3986 unreserved (`~user` paths) and `)` is a
+  // sub-delim (parenthesised region suffixes); both are ordinary URL characters.
+  for (const [url, label] of [
+    ['https://jobs.example.com/~acme/jobs/11', 'a tilde path survives intact'],
+    ['https://jobs.example.com/jobs/12(eu)', 'a parenthesised suffix survives intact'],
+  ]) {
+    const got = seenUrlsFor(`- [ ] ${url} | Acme Corp | Staff Engineer\n`);
+    if (got.size === 1 && got.has(normalizeUrlForDedup(url))) pass(`pipeline.md: ${label}`);
+    else fail(`${label} — expected [${normalizeUrlForDedup(url)}], got [${[...got].join(', ')}]`);
+  }
 } catch (err) {
-  fail(`scan.mjs loadSeenUrls tests crashed: ${err && err.message}`);
-} finally {
-  rmSync(SANDBOX, { recursive: true, force: true });
+  fail(`scan.mjs collectSeenUrls tests crashed: ${err && err.message}`);
 }

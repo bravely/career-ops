@@ -116,3 +116,5 @@ public commit with a stated reason.
 - @alexkons | Alekons | 2026-08-07 | id:22054290 | src:https://github.com/santifer/career-ops/discussions/2578 | n:68
 - @raghavrallan | Raghav Rallan | 2026-08-08 | id:168067295 | src:https://github.com/santifer/career-ops/discussions/2622 | n:69
 - @iyousif | Yousif Anwar | 2026-08-09 | "Makes the world a better place. One update at a time!" | id:18438102 | src:https://github.com/santifer/career-ops/discussions/2638 | n:70
+- @Honeypanchi | 2026-08-10 | "Garv Sajnani" | id:146434822 | src:https://github.com/santifer/career-ops/discussions/2660 | n:71
+- @abankar1 | Akshay Bankar | 2026-08-11 | "career-ops is more than a job-search helper - it runs the whole pipeline locally, and a search you can audit is a search you can win." | id:47008224 | src:https://github.com/santifer/career-ops/discussions/2712 | n:72
