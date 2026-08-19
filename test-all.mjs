@@ -18,9 +18,19 @@
  *   data, paths, etc.) is SKIPPED. A green `--only` run is NOT a green
  *   suite. Always run the full suite (no flags) before pushing.
  *
- * Provider tests live in tests/providers/{name}.test.mjs and are
- * auto-discovered — no registration needed. To add a test for a new
- * provider, create that one file; do not add a section to this file.
+ * NEW TESTS GO IN A FILE OF THEIR OWN, NOT IN A SECTION HERE.
+ * Anything matching tests/**\/*.test.mjs is auto-discovered — no registration,
+ * no section number. Provider tests are one case of this
+ * (tests/providers/{name}.test.mjs), not the only one.
+ *
+ * Why it matters beyond tidiness: a numbered section means editing the end of
+ * this file, and the section number is a global label picked by hand. Six
+ * contributors doing that at once in Aug-2026 all picked `60a` and each merge
+ * forced a rebase on the other five - about fifteen rebases and six serialized
+ * CI runs for six lines of test code. A new file collides with nobody, so
+ * those PRs can all land in parallel.
+ *
+ * The inline sections below are history, not a pattern to copy.
  */
 
 
@@ -30,7 +40,7 @@ import { join, dirname, basename, delimiter } from 'path';
 import { tmpdir } from 'os';
 import { promisify } from 'util';
 import { fileURLToPath, pathToFileURL } from 'url';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import { pass, fail, warn, run, lastRunFailure, formatRunFailure, fileExists, finish, ROOT, QUICK, NODE, getBash, toBashPath } from './tests/helpers.mjs';
 import { flagValue, hasFlag } from './lib/cli-flags.mjs';
 
@@ -150,7 +160,26 @@ async function runDiscovered(filter = null) {
       fail(`${f.slice(ROOT.length + 1)} calls finish() — only test-all.mjs may print the global summary; discovered suites use pass/fail and return`);
       continue;
     }
-    await import(pathToFileURL(f).href);
+    // Neither guard above survives contact with an uncaught THROW, which ends
+    // the run just as completely and rather more quietly: node unwinds straight
+    // out of test-all, finish() never prints its summary, and every suite
+    // sorting after this one silently never runs. That does not read as a
+    // broken suite — it reads as a finished one, so the screen of green above
+    // the cut looks like a pass. (Measured on a Windows box with no symlink
+    // privilege: tests/intake.test.mjs threw at import and took 2067 of 3693
+    // checks with it, with no verdict line at all — #2828.) A discovered suite
+    // is a guest, not a co-host: its crash is one failure, not the end of the
+    // run.
+    try {
+      await import(pathToFileURL(f).href);
+    } catch (err) {
+      fail(`${rel} — suite threw and was contained (${err?.code ?? err?.name ?? 'Error'}): ${err?.message ?? err}`);
+      // The throw site, not just the message: a suite that dies mid-import
+      // leaves no other clue how far it got.
+      for (const line of String(err?.stack ?? '').split('\n').slice(1, 4)) {
+        if (line.trim()) console.log(`      ${line.trim()}`);
+      }
+    }
   }
 }
 
@@ -250,11 +279,13 @@ const scripts = [
   { name: 'check-table-freshness.mjs --self-test', expectExit: 0 },
   { name: 'upskill.mjs --self-test', expectExit: 0 },
   { name: 'detect-reposts.mjs --self-test', expectExit: 0 },
+  { name: 'rank-pipeline.mjs --self-test', expectExit: 0 },
   { name: 'discover-ats.mjs --self-test', expectExit: 0 },
   { name: 'process-quality.mjs --self-test', expectExit: 0 },
   { name: 'company-history.mjs --self-test', expectExit: 0 },
   { name: 'rejection-latency.mjs --self-test', expectExit: 0 },
   { name: 'salary-gap.mjs --self-test', expectExit: 0 },
+  { name: 'negotiation-roi.mjs --self-test', expectExit: 0 },
   { name: 'funnel-velocity.mjs --self-test', expectExit: 0 },
   { name: 'img-to-pdf.mjs --self-test', expectExit: 0 },
   { name: 'assessment-log.mjs --self-test', expectExit: 0 },
@@ -266,6 +297,7 @@ const scripts = [
   { name: 'company-funded.mjs --self-test', expectExit: 0 },
   { name: 'invite-match.mjs --self-test', expectExit: 0 },
   { name: 'invite-match.test.mjs', expectExit: 0 },
+  { name: 'tracker-sync-check.mjs --self-test', expectExit: 0 },
   { name: 'updater-migration-tests.mjs', expectExit: 0 },
   { name: 'tracker-columns-tests.mjs', expectExit: 0 },
   { name: 'agent-inbox-tests.mjs', expectExit: 0 },
@@ -374,6 +406,123 @@ try {
       // failure arrives as a bare `<name> crashed`: no stack, no assertion
       // text, no exit code, and nothing a reader can act on.
       fail(`${name} crashed${formatRunFailure()}`);
+    }
+  }
+
+  // assessment-log.mjs CLI contract (#2797): help aliases print one shared
+  // usage block, unknown leading-dash arguments fail loudly, and the existing
+  // add/summary paths still accept ordinary values that merely contain dashes.
+  {
+    const assessmentCli = (...argv) => spawnSync(NODE, [join(scriptTmp, 'assessment-log.mjs'), ...argv], {
+      cwd: scriptTmp,
+      encoding: 'utf-8',
+      timeout: 30000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const helpR = assessmentCli('--help');
+    const hR = assessmentCli('-h');
+    if (helpR.status === 0 && hR.status === 0 && helpR.stdout.includes('Usage:')
+        && helpR.stdout.includes('--self-test') && hR.stdout === helpR.stdout
+        && helpR.stderr === '' && hR.stderr === '') {
+      pass('assessment-log.mjs --help/-h print the shared usage block and exit 0 (#2797)');
+    } else {
+      fail(`assessment-log.mjs help handling broken: ${JSON.stringify({ help: { status: helpR.status, stdout: helpR.stdout, stderr: helpR.stderr }, h: { status: hR.status, stdout: hR.stdout, stderr: hR.stderr } })}`);
+    }
+
+    const typoR = assessmentCli('--sumary');
+    const misplacedAddFlagR = assessmentCli('--company', 'Acme-Co');
+    if (typoR.status === 1 && typoR.stderr.includes('unrecognized flag')
+        && typoR.stderr.includes('--sumary') && typoR.stderr.includes('Valid flags:')
+        && typoR.stderr.includes('Usage:') && typoR.stdout === ''
+        && misplacedAddFlagR.status === 1 && misplacedAddFlagR.stderr.includes('--company')) {
+      pass('assessment-log.mjs rejects and names an unrecognized leading-dash flag (#2797)');
+    } else {
+      fail(`assessment-log.mjs unknown flag handling broken: ${JSON.stringify({ typo: { status: typoR.status, stdout: typoR.stdout, stderr: typoR.stderr }, misplacedAddFlag: { status: misplacedAddFlagR.status, stdout: misplacedAddFlagR.stdout, stderr: misplacedAddFlagR.stderr } })}`);
+    }
+
+    const addR = assessmentCli(
+      'add', '--company', 'Acme-Co', '--platform', 'eSkill', '--subject',
+      '-Data-Analysis', '--threshold', '70', '--score', '85'
+    );
+    const summaryR = assessmentCli('--summary');
+    let added = null;
+    try { added = JSON.parse(addR.stdout); } catch {}
+    if (addR.status === 0 && added?.added === true
+        && added.row?.[1] === 'Acme-Co' && added.row?.[4] === '-Data-Analysis'
+        && summaryR.status === 0 && summaryR.stdout.includes('Acme-Co')
+        && summaryR.stdout.includes('Data-Analysis')) {
+      pass('assessment-log.mjs preserves add/summary flags and dash-containing values (#2797 regression)');
+    } else {
+      fail(`assessment-log.mjs existing CLI behavior regressed: ${JSON.stringify({ add: { status: addR.status, stdout: addR.stdout, stderr: addR.stderr }, summary: { status: summaryR.status, stdout: summaryR.stdout, stderr: summaryR.stderr } })}`);
+    }
+  }
+
+  // reply-watch.mjs CLI flag validation (#2743). main() used to read
+  // process.argv[2] purely positionally with no flag checking: `--help` or
+  // any typo'd flag silently became the "candidates path" argument, and
+  // since that "path" doesn't exist, ensureCandidatesFile() created a real
+  // file named e.g. `--help` on disk. Mirrors the scan-ats-full.mjs
+  // KNOWN_FLAGS precedent (#1633/#1635): --help/-h print usage and exit 0,
+  // any other flag-looking arg is rejected with exit 1 — neither path
+  // should ever touch the filesystem.
+  {
+    const replyWatchCli = (...argv) => spawnSync(NODE, [join(scriptTmp, 'reply-watch.mjs'), ...argv], {
+      cwd: scriptTmp,
+      encoding: 'utf-8',
+      timeout: 30000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const helpR = replyWatchCli('--help');
+    const hR = replyWatchCli('-h');
+    const bogusR = replyWatchCli('--bogus');
+
+    const helpOk = helpR.status === 0 && /Usage:/.test(helpR.stdout)
+      && !existsSync(join(scriptTmp, '--help'));
+    const hOk = hR.status === 0 && /Usage:/.test(hR.stdout)
+      && !existsSync(join(scriptTmp, '-h'));
+    const bogusOk = bogusR.status === 1 && /unrecognized flag/.test(bogusR.stderr)
+      && bogusR.stderr.includes('--bogus') && !existsSync(join(scriptTmp, '--bogus'));
+
+    if (helpOk && hOk && bogusOk) {
+      pass('reply-watch.mjs rejects --help/-h/unrecognized flags without creating a stray candidates file (#2743)');
+    } else {
+      fail(`reply-watch.mjs flag validation broken: help=${JSON.stringify({ status: helpR.status, stdout: helpR.stdout, exists: existsSync(join(scriptTmp, '--help')) })} h=${JSON.stringify({ status: hR.status, stdout: hR.stdout, exists: existsSync(join(scriptTmp, '-h')) })} bogus=${JSON.stringify({ status: bogusR.status, stderr: bogusR.stderr, exists: existsSync(join(scriptTmp, '--bogus')) })}`);
+    }
+
+    // CodeRabbit (#2745): --help paired with an unrecognized flag must still
+    // reject — unknown-flag validation has to run before --help short-circuits,
+    // otherwise `reply-watch.mjs --help --bogus` would exit 0 instead of erroring.
+    const mixedR = replyWatchCli('--help', '--bogus');
+    const mixedOk = mixedR.status === 1 && /unrecognized flag/.test(mixedR.stderr)
+      && mixedR.stderr.includes('--bogus') && !/Usage:/.test(mixedR.stdout)
+      && !existsSync(join(scriptTmp, '--help')) && !existsSync(join(scriptTmp, '--bogus'));
+    if (mixedOk) {
+      pass('reply-watch.mjs rejects an unrecognized flag even when --help is also present (#2745)');
+    } else {
+      fail(`reply-watch.mjs --help+--bogus should still error, not exit clean: ${JSON.stringify({ status: mixedR.status, stdout: mixedR.stdout, stderr: mixedR.stderr })}`);
+    }
+
+    // Regression: the existing no-args-uses-default and explicit-path
+    // behaviors must be unchanged by the new flag-parsing gate. Both run to
+    // completion here — the copied scriptTmp tracker has zero rows, so no
+    // candidates ever match an application, no update-recommendation prompt
+    // fires, and the process exits on its own without touching stdin.
+    const defaultCandidatesFile = join(scriptTmp, 'data', 'reply-candidates.json');
+    const noArgsR = replyWatchCli();
+    const noArgsOk = noArgsR.status === 0 && existsSync(defaultCandidatesFile)
+      && /application updates need review/.test(noArgsR.stdout);
+
+    const explicitPath = join(scriptTmp, 'my-candidates.json');
+    const explicitR = replyWatchCli(explicitPath);
+    const explicitOk = explicitR.status === 0 && existsSync(explicitPath)
+      && /application updates need review/.test(explicitR.stdout);
+
+    if (noArgsOk && explicitOk) {
+      pass('reply-watch.mjs no-args-uses-default and explicit-path behaviors unchanged (#2743 regression)');
+    } else {
+      fail(`reply-watch.mjs regression broken: noArgs=${JSON.stringify({ status: noArgsR.status, exists: existsSync(defaultCandidatesFile) })} explicit=${JSON.stringify({ status: explicitR.status, exists: existsSync(explicitPath) })}`);
     }
   }
 } finally {
@@ -702,6 +851,22 @@ try {
     const cvWdLive = await checkLivenessViaApi(wdUrl);
     globalThis.fetch = async () => ({ status: 404 });
     const cvWdGone = await checkLivenessViaApi(wdUrl);
+    // Lever: unlike Greenhouse/Workday, a 404 on the public postings API is NOT
+    // authoritative proof of removal. Lever's Confidential/Internal Postings
+    // feature explicitly excludes some live postings from the public API while
+    // the direct jobs.lever.co page keeps serving them (real-world repro:
+    // Simbe Robotics and Enable postings, 2026-08-09 — api.lever.co 404s, the
+    // live page renders the real title with a working Apply control). So a
+    // Lever 404/410 must fall through to Playwright (null), not conclude
+    // expired outright, the same "let the browser decide" treatment other
+    // ambiguous cases already get.
+    const lvUrl = 'https://jobs.lever.co/acme/abc-123-def';
+    globalThis.fetch = async () => ({ status: 200 });
+    const cvLvLive = await checkLivenessViaApi(lvUrl);
+    globalThis.fetch = async () => ({ status: 404 });
+    const cvLvGone = await checkLivenessViaApi(lvUrl);
+    globalThis.fetch = async () => ({ status: 410 });
+    const cvLvGone410 = await checkLivenessViaApi(lvUrl);
     if (cvAshbyLive?.result === 'active' && cvAshbyLive?.code === 'ashby_api_ok'
         && cvAshbyGone?.result === 'expired' && cvAshbyGone?.code === 'ashby_api_unlisted'
         && cvAshbyMalformed === null
@@ -713,6 +878,13 @@ try {
       pass('checkLivenessViaApi: 200→interpret (Ashby), malformed→null, greenhouse/workday 200→active, 404→expired, fetch error→null');
     } else {
       fail(`checkLivenessViaApi wrong: ashbyLive=${JSON.stringify(cvAshbyLive)} ashbyGone=${JSON.stringify(cvAshbyGone)} malformed=${JSON.stringify(cvAshbyMalformed)} ghLive=${JSON.stringify(cvGhLive)} gone=${JSON.stringify(cvGone)} err=${JSON.stringify(cvErr)} wdLive=${JSON.stringify(cvWdLive)} wdGone=${JSON.stringify(cvWdGone)}`);
+    }
+    if (cvLvLive?.result === 'active' && cvLvLive?.code === 'lever_api_ok'
+        && cvLvGone === null
+        && cvLvGone410 === null) {
+      pass('checkLivenessViaApi: Lever 200→active, 404/410→null (inconclusive, unlike Greenhouse/Workday — Confidential Postings can 404 on the public API while still live)');
+    } else {
+      fail(`checkLivenessViaApi (Lever) wrong: live=${JSON.stringify(cvLvLive)} gone404=${JSON.stringify(cvLvGone)} gone410=${JSON.stringify(cvLvGone410)}`);
     }
   } finally {
     globalThis.fetch = origFetch;
@@ -759,6 +931,102 @@ try {
     bodyText: 'Administrator SAP Utilities. '.repeat(20),
     applyControls: ['Apply for this job'],
   });
+
+  // --- iframe-embedded postings -------------------------------------------
+  // Some ATS (iCIMS) render the posting inside a same-origin iframe and leave
+  // the top-level document as a ~13-character shell, which used to reach
+  // insufficient_content and return `expired` for a live job.
+  //
+  // `fillAfter` models the part that made the first attempt at this fix a
+  // no-op: the frame ATTACHES immediately but POPULATES late (measured 0 chars
+  // at 2000ms, 3887 at 4000ms), so a reader that does not wait sees an empty
+  // document and nothing changes.
+  const framedPage = ({ status = 200, finalUrl, shellText = 'Careers', frames = [] }) => {
+    const page = {};
+    const main = { __main: true };
+    const built = frames.map((spec) => {
+      let textReads = 0;
+      return {
+        url: () => spec.url,
+        async evaluate(fn) {
+          // Both extractors mention innerText, so discriminate on the selector
+          // call that only the apply-control extractor makes.
+          const isControls = String(fn).includes('querySelectorAll');
+          const filled = textReads >= (spec.fillAfter ?? 0);
+          if (!isControls) textReads += 1;
+          if (isControls) return filled ? (spec.controls ?? []) : [];
+          return filled ? spec.text : '';
+        },
+      };
+    });
+    let evalCall = 0;
+    Object.assign(page, {
+      async goto() { return { status: () => status }; },
+      async waitForTimeout() {},
+      url() { return finalUrl; },
+      frames() { return [main, ...built]; },
+      mainFrame() { return main; },
+      async evaluate() { evalCall += 1; return evalCall === 1 ? shellText : []; },
+    });
+    return page;
+  };
+
+  const SHELL = 'https://careers-example.icims.com/jobs/1/role/job';
+  const framedLive = await checkUrlLiveness(framedPage({
+    finalUrl: SHELL,
+    frames: [{ url: SHELL + '?in_iframe=1', text: 'Senior Analyst. '.repeat(30), controls: ['Apply for this job online'], fillAfter: 2 }],
+  }), SHELL);
+  if (framedLive.result === 'active' && framedLive.code === 'apply_control_visible') {
+    pass('liveness reads a same-origin posting frame that populates late');
+  } else {
+    fail(`late-filling posting frame not read: ${JSON.stringify(framedLive)}`);
+  }
+
+  const crossOrigin = await checkUrlLiveness(framedPage({
+    finalUrl: SHELL,
+    frames: [{ url: 'https://ads.example.net/widget', text: 'Sponsored. '.repeat(30), controls: ['Apply now'] }],
+  }), SHELL);
+  if (crossOrigin.result === 'expired' && crossOrigin.code === 'insufficient_content') {
+    pass('a cross-origin frame cannot make an empty shell look active');
+  } else {
+    fail(`cross-origin frame leaked into the verdict: ${JSON.stringify(crossOrigin)}`);
+  }
+
+  const goneWithFrame = await checkUrlLiveness(framedPage({
+    status: 410,
+    finalUrl: SHELL,
+    frames: [{ url: SHELL + '?in_iframe=1', text: 'Job not found. '.repeat(30), controls: ['Apply for this job online'] }],
+  }), SHELL);
+  if (goneWithFrame.result === 'expired' && goneWithFrame.code === 'http_gone') {
+    pass('HTTP 410 still wins over a frame carrying an apply control');
+  } else {
+    fail(`410 precedence lost to frame aggregation: ${JSON.stringify(goneWithFrame)}`);
+  }
+
+  // A 410 must not pay the frame poll: the status already decided it, and a
+  // dead posting whose error page renders into an iframe would otherwise wait
+  // for that error page to fill before saying what it knew at byte one.
+  // Count only the 500ms poll waits; the 2000ms hydration wait always happens.
+  let pollWaits = 0;
+  const gonePage = framedPage({
+    status: 410,
+    finalUrl: SHELL,
+    frames: [{ url: SHELL + '?in_iframe=1', text: '', controls: [], fillAfter: 999 }],
+  });
+  gonePage.waitForTimeout = async (ms) => { if (ms === 500) pollWaits += 1; };
+  const goneFast = await checkUrlLiveness(gonePage, SHELL);
+  if (goneFast.result === 'expired' && goneFast.code === 'http_gone' && pollWaits === 0) {
+    pass('HTTP 410 short-circuits before the frame poll (no wait spent)');
+  } else {
+    fail(`410 did not short-circuit: ${JSON.stringify(goneFast)}, poll waits=${pollWaits}`);
+  }
+
+  const legacyDouble = await checkUrlLiveness(livePage(), URL);
+  if (legacyDouble.result === 'active') {
+    pass('a page object without frames()/mainFrame() still returns a top-level verdict');
+  } else {
+    fail(`frame aggregation broke a frameless page object: ${JSON.stringify(legacyDouble)}`);
+  }
 
   if (isChallengeResult({ result: 'uncertain', code: 'bot_challenge' }) &&
       isChallengeResult({ result: 'uncertain', code: 'access_blocked' }) &&
@@ -963,6 +1231,146 @@ try {
   }
 } catch (e) {
   fail(`Liveness classification tests crashed: ${e.message}`);
+}
+
+// ── 3b. ARCHIVE-POSTING EGRESS GUARD (#1956) ────────────────────
+//
+// archive-posting.mjs drives Playwright at a URL the user pastes in (or that
+// arrives via data/pipeline.md), and used to navigate with zero egress
+// safeguards — so a hostile posting link could render an internal service or a
+// cloud metadata endpoint straight into a PDF. It now wires up the *same*
+// two-layer guard liveness-browser.mjs exports rather than carrying a second
+// implementation, so these tests pin the wiring, not a copy of the guard logic.
+try {
+  const { archiveUrl, installEgressGuard } = await import(
+    pathToFileURL(join(ROOT, 'archive-posting.mjs')).href
+  );
+  const { setHostResolver } = await import(
+    pathToFileURL(join(ROOT, 'liveness-browser.mjs')).href
+  );
+
+  // Stop each run the moment navigation starts: everything after goto() is PDF
+  // rendering and a writeFile into jds/, which these assertions don't need and
+  // must not perform.
+  const STOP = 'archive-guard-test-stop';
+
+  // Records what the guard did, and never lets the flow reach page.pdf().
+  function makeMockBrowser({ landedUrl = 'https://example.com/job/1' } = {}) {
+    const state = { routeCallback: null, contextCreated: false, closed: false };
+    const context = {
+      async route(pattern, callback) {
+        state.pattern = pattern;
+        state.routeCallback = callback;
+      },
+      async newPage() {
+        return {
+          async goto() {
+            if (state.stopAtGoto) throw new Error(STOP);
+            return { status: () => 200 };
+          },
+          url: () => landedUrl,
+          async waitForTimeout() { throw new Error(STOP); },
+          async title() { return ''; },
+          async $eval() { return ''; },
+        };
+      },
+      async close() { state.closed = true; },
+    };
+    const browser = {
+      async newContext() {
+        state.contextCreated = true;
+        return context;
+      },
+    };
+    return { browser, state };
+  }
+
+  // Drives a registered route handler and reports the verdict it reached.
+  async function runGuard(requestUrl) {
+    const { browser, state } = makeMockBrowser();
+    state.stopAtGoto = true;
+    await archiveUrl(browser, 'https://example.com/job/1').catch(() => {});
+    if (!state.routeCallback) return { registered: false };
+    let verdict = null;
+    await state.routeCallback({
+      request: () => ({ url: () => requestUrl }),
+      abort: async (code) => { verdict = { action: 'abort', code }; },
+      continue: async () => { verdict = { action: 'continue' }; },
+    });
+    return { registered: true, verdict, pattern: state.pattern };
+  }
+
+  // 1. Pre-navigation refusal — an obviously-internal target must not reach
+  //    Playwright at all, so no context is ever created.
+  const { browser: preBrowser, state: preState } = makeMockBrowser();
+  let preError = null;
+  await archiveUrl(preBrowser, 'http://169.254.169.254/latest/meta-data/')
+    .catch((err) => { preError = err; });
+  if (preError && /restricted destination/.test(preError.message) && !preState.contextCreated) {
+    pass('archive-posting refuses a private-IP target before opening a browser context');
+  } else {
+    fail(`archive-posting pre-navigation guard failed: error=${preError?.message ?? 'none'}, contextCreated=${preState.contextCreated}`);
+  }
+
+  // 2. The guard is registered on the context for every request, not just the
+  //    page's first hop — a page-scoped route wouldn't cover the whole flow.
+  const registration = await runGuard('https://example.com/assets/logo.png');
+  if (registration.registered && registration.pattern === '**/*') {
+    pass('archive-posting registers the egress guard on the context for all requests');
+  } else {
+    fail(`archive-posting did not register a context-wide route: ${JSON.stringify(registration)}`);
+  }
+
+  // 3. Legitimate subresources still go through — a guard that blocks
+  //    everything would pass a naive block-only test while breaking archiving.
+  if (registration.verdict?.action === 'continue') {
+    pass('archive-posting egress guard allows legitimate public requests');
+  } else {
+    fail(`archive-posting egress guard blocked a legitimate request: ${JSON.stringify(registration.verdict)}`);
+  }
+
+  // 4. Redirect hop straight to a literal private address.
+  const literalHop = await runGuard('http://10.0.0.5/internal');
+  if (literalHop.verdict?.action === 'abort' && literalHop.verdict.code === 'blockedbyclient') {
+    pass('archive-posting egress guard blocks a redirect hop to a literal private IP');
+  } else {
+    fail(`archive-posting egress guard let a private-IP hop through: ${JSON.stringify(literalHop.verdict)}`);
+  }
+
+  // 5. The case the literal-host check cannot see: a public-looking hostname
+  //    that resolves into loopback. Without the DNS layer this hop is allowed,
+  //    which is the whole reason validateUrlSecurity is reused here.
+  const restoreArchiveResolver = setHostResolver(async (hostname) => (
+    hostname === 'ssrf-blocked-host.local' ? ['127.0.0.1'] : ['93.184.216.34']
+  ));
+  try {
+    const dnsHop = await runGuard('http://ssrf-blocked-host.local/sensitive-internal');
+    if (dnsHop.verdict?.action === 'abort' && dnsHop.verdict.code === 'blockedbyclient') {
+      pass('archive-posting egress guard blocks a hostname that resolves to loopback');
+    } else {
+      fail(`archive-posting egress guard missed a DNS-resolved private target: ${JSON.stringify(dnsHop.verdict)}`);
+    }
+  } finally {
+    restoreArchiveResolver();
+  }
+
+  // 6. Landed-URL re-check after navigation. A first-hop-only check is the
+  //    classic miss, so the settled URL is asserted too.
+  const { browser: landedBrowser } = makeMockBrowser({ landedUrl: 'http://169.254.169.254/latest/meta-data/' });
+  let landedError = null;
+  await archiveUrl(landedBrowser, 'https://example.com/job/1')
+    .catch((err) => { landedError = err; });
+  if (landedError && /after redirect/.test(landedError.message)) {
+    pass('archive-posting refuses to render a page that landed on a private address');
+  } else {
+    fail(`archive-posting landed-URL guard failed: ${landedError?.message ?? 'no error'}`);
+  }
+
+  if (typeof installEgressGuard !== 'function') {
+    fail('archive-posting does not export installEgressGuard');
+  }
+} catch (e) {
+  fail(`archive-posting egress guard tests crashed: ${e.message}`);
 }
 
 // ── 4. DASHBOARD BUILD ──────────────────────────────────────────
@@ -1796,8 +2204,10 @@ const patternsMachineFields = readFile('analyze-patterns.mjs').match(/const MACH
 if (
   /^via:/m.test(batchMachineSummary) &&
   /^company_confidential:/m.test(batchMachineSummary) &&
+  /^reports_to:/m.test(batchMachineSummary) &&
   /['"]via['"]/.test(patternsMachineFields) &&
-  /['"]company_confidential['"]/.test(patternsMachineFields)
+  /['"]company_confidential['"]/.test(patternsMachineFields) &&
+  /['"]reports_to['"]/.test(patternsMachineFields)
 ) {
   pass('batch Machine Summary fields are preserved by the downstream parser');
 } else {
@@ -3084,6 +3494,20 @@ if ((batchPromptDoc.match(/advertised_comp/g) || []).length >= 2) {
   fail('batch prompt missing advertised_comp in one or both Machine Summary fences');
 }
 
+// One YAML fence at a time, each bounded to its own step. A count over the
+// whole file passes when one fence carries the key twice and the other carries
+// it not at all, and an unbounded tail lets any later line stand in for the
+// Step 3 fence.
+const step2SchemaSection = batchPromptDoc.match(/#### Machine Summary[\s\S]*?### Step 3 \u2014 Save the Report/)?.[0] ?? '';
+const step2SchemaFence = step2SchemaSection.match(/```yaml\n([\s\S]*?)\n```/)?.[1] ?? '';
+const step3Section = batchPromptDoc.match(/### Step 3 \u2014 Save the Report[\s\S]*?### Step 4 \u2014/)?.[0] ?? '';
+const step3SummaryFence = step3Section.match(/## Machine Summary\s*\n+```yaml\n([\s\S]*?)\n```/)?.[1] ?? '';
+if (/^reports_to:/m.test(step2SchemaFence) && /^reports_to:/m.test(step3SummaryFence)) {
+  pass('batch prompt carries reports_to in both Machine Summary fences');
+} else {
+  fail('batch prompt missing reports_to in one or both Machine Summary fences');
+}
+
 // ── upskill Learning Plan trust model (#1740, phase 2b) ──
 // The learning plan (Step 3) layers web-searched resources onto the phase-1 gap
 // heatmap. Its eight trust-model promises are load-bearing: each is frozen here
@@ -4350,6 +4774,50 @@ try {
     fail('verify-portals missing deepsetai suffix for Deepset');
   }
 
+  // ── ASCII fold (#2930) ──
+  // The bug: `[^a-z0-9\s]` turned an accented letter into a SEPARATOR, so
+  // "Telefónica" became the two words "telef nica" and never produced
+  // "telefonica" — the slug the board actually uses. --add then reported a live
+  // board as missing. "Société Générale" shattered into four fragments, so even
+  // the first-word heuristic yielded "soci" instead of "societe".
+  const accented = [
+    ['Telefónica', 'telefonica'],
+    ['Société Générale', 'societegenerale'],
+    ['Nestlé', 'nestle'],
+    ['Ørsted', 'orsted'],   // ø does not decompose under NFD
+    ['Æon', 'aeon'],        // æ expands to two letters
+    // Letters NFD does not decompose: the stroke/bar is part of the glyph, so
+    // stripping combining marks leaves them and [^a-z0-9] deletes them
+    // (CodeRabbit, reviewing #2927). No substring luck here — "Işık" derived
+    // "isk" and never "isik", so --add probed a slug no board uses.
+    ['Işık', 'isik'],       // Turkish dotless ı
+    ['Ħamrun', 'hamrun'],   // Maltese ħ
+    ['Ŧorne', 'torne'],     // ŧ
+    ['Ŋaro', 'ngaro'],      // ŋ romanises as "ng", not "n"
+  ];
+  const missedFold = accented.filter(([name, want]) => !deriveSlugCandidates(name).includes(want));
+  if (missedFold.length === 0) {
+    pass('verify-portals ASCII-folds accented names to the slug the board actually uses');
+  } else {
+    fail(`verify-portals slug fold missed: ${missedFold.map(([n, w]) => `${n}->${w}`).join(', ')}`);
+  }
+
+  // The fold must not turn every name into a match: a distinct company must
+  // still derive a distinct slug. Without this, returning a constant passes.
+  if (!deriveSlugCandidates('Telefónica').includes('vodafone') && deriveSlugCandidates('Société Générale').includes('societe')) {
+    pass('verify-portals fold keeps distinct names distinct and preserves the first-word candidate');
+  } else {
+    fail('verify-portals fold collapsed distinct names or lost the first-word candidate');
+  }
+
+  // A name with no Latin content folds to '' — a real answer (ATS slugs are
+  // ASCII), which runAdd now reports as such instead of "needs a company name".
+  if (deriveSlugCandidates('楽天').length === 0 && deriveSlugCandidates('Сбербанк').length === 0) {
+    pass('verify-portals derives no slug from a name with no Latin content');
+  } else {
+    fail('verify-portals derived an ASCII slug from a non-Latin name');
+  }
+
   if (
     classifyFetchError({ status: 404 }) === 'slug_gone' &&
     classifyFetchError({ name: 'AbortError' }) === 'network' &&
@@ -5245,6 +5713,110 @@ console.log('\n12b. Skill entrypoint bootstrap (npx / old releases)');
 
 console.log('\n12c. Materialized skill index mode');
 
+/**
+ * Build a git environment nothing ambient can reach into.
+ *
+ * GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM pin the FILE layers. They do not
+ * close the RUNTIME layer: GIT_CONFIG_COUNT with its KEY_n / VALUE_n pairs is
+ * applied AFTER every config file, so an ambient `core.excludesFile` injected
+ * that way overrides even the one a fixture sets for itself, and the isolation
+ * silently stops holding - the exact leak this pinning exists to close,
+ * arriving through the one door left open (#2567).
+ *
+ * COUNT is set to 0 rather than deleting the variables: it is a single
+ * authoritative value, and git reads KEY_n / VALUE_n only up to COUNT, so any
+ * stragglers are inert without having to enumerate them.
+ *
+ * `base` exists so the regression case below can hand in a parent environment
+ * carrying the injection. Both callers share this one construction on purpose:
+ * a test that hand-rolled its own env would keep passing if the pin were
+ * dropped here, which is how the gap got in.
+ */
+function hermeticGitEnv(gitConfigPath, base = process.env) {
+  const env = {
+    ...base,
+    GIT_CONFIG_COUNT: '0',
+    GIT_CONFIG_GLOBAL: gitConfigPath,
+    GIT_CONFIG_SYSTEM: gitConfigPath,
+  };
+  // These two DO have to be enumerated, because COUNT governs KEY_n / VALUE_n
+  // and nothing else, and neither of them is a config FILE that GLOBAL/SYSTEM
+  // could shadow. Both survive all three pins above:
+  //
+  //   GIT_CONFIG_PARAMETERS  the channel git uses to hand `-c` down to a
+  //                          subprocess, so it reaches every git invocation.
+  //                          Measured: with it set, a commit made through this
+  //                          env took its author from the ambient value.
+  //   GIT_CONFIG             redirects the `git config` command, reads AND
+  //                          writes. Both fixtures below call `git config` to
+  //                          set themselves up, so with it set that write lands
+  //                          in the ambient file instead of the fixture: the
+  //                          setting never takes effect, and the suite mutates
+  //                          a file outside its own temp dir.
+  delete env.GIT_CONFIG_PARAMETERS;
+  delete env.GIT_CONFIG;
+  return env;
+}
+
+// Asserted through hermeticGitEnv rather than around it, and on BEHAVIOUR rather
+// than on the absence of a key: a check that the returned object lacks the two
+// names would pass on any implementation that deletes them, including one that
+// deletes them after git has already been handed the environment. What matters
+// is that the injection does not reach git.
+{
+  const root = mkdtempSync(join(tmpdir(), 'career-ops-hermetic-env-'));
+  try {
+    const pinned = join(root, 'gitconfig');
+    writeFileSync(pinned, '');
+    const ambient = join(root, 'ambient-config');
+    writeFileSync(ambient, '[user]\n\tname = ambient-leak\n');
+    const repo = join(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+
+    const gitEnv = hermeticGitEnv(pinned, {
+      ...process.env,
+      GIT_CONFIG_PARAMETERS: "'user.name=parameters-leak'",
+      GIT_CONFIG: ambient,
+    });
+    const gitRun = (args) => execFileSync('git', args, {
+      cwd: repo, encoding: 'utf-8', timeout: 30000, env: gitEnv,
+    }).trim();
+
+    gitRun(['init']);
+    let seenName = '';
+    try {
+      seenName = gitRun(['config', 'user.name']);
+    } catch (err) {
+      // `git config <key>` exits 1 for "not set", which is the outcome this
+      // block asserts. Anything else means the probe never ran: 128 for a
+      // broken repo, 129 for a bad invocation. Swallowing those would turn a
+      // failed probe into evidence that the isolation works.
+      if (err?.status !== 1) throw err;
+      seenName = '';
+    }
+    if (seenName === '') {
+      pass('hermeticGitEnv keeps an ambient GIT_CONFIG_PARAMETERS / GIT_CONFIG out of git');
+    } else {
+      fail(`ambient config reached git through hermeticGitEnv: user.name = ${seenName}`);
+    }
+
+    // The write half. Both fixtures in this file configure themselves with
+    // `git config`, and under an ambient GIT_CONFIG that write leaves the
+    // fixture entirely - so the setting silently does not apply, and the suite
+    // edits a file it does not own.
+    gitRun(['config', 'core.excludesFile', join(root, 'excludes')]);
+    const landedLocally = readFileSync(join(repo, '.git', 'config'), 'utf-8').includes('excludesFile');
+    const escaped = readFileSync(ambient, 'utf-8').includes('excludesFile');
+    if (landedLocally && !escaped) {
+      pass("a fixture's own `git config` write stays inside the fixture");
+    } else {
+      fail(`git config write escaped the fixture: local=${landedLocally} ambient=${escaped}`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 {
   const fixtureRoot = mkdtempSync(join(tmpdir(), 'career-ops-skill-git-'));
   // The fixture stages the very paths career-ops legitimately tracks - .agents/,
@@ -5271,7 +5843,7 @@ console.log('\n12c. Materialized skill index mode');
   // both platforms tested but are not worth depending on.
   const emptyExcludes = join(gitConfigRoot, 'empty-excludes');
   writeFileSync(emptyExcludes, '');
-  const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: gitConfigPath, GIT_CONFIG_SYSTEM: gitConfigPath };
+  const gitEnv = hermeticGitEnv(gitConfigPath);
   const gitRun = (args, opts = {}) => execFileSync('git', args, {
     cwd: fixtureRoot,
     encoding: 'utf-8',
@@ -5301,7 +5873,16 @@ console.log('\n12c. Materialized skill index mode');
     // core.excludesFile is only the GLOBAL layer. `git init` also seeds
     // .git/info/exclude from a template, which GIT_TEMPLATE_DIR can still point
     // at an ambient one, so empty that layer too rather than assume it is inert.
-    writeFileSync(join(fixtureRoot, '.git', 'info', 'exclude'), '');
+    //
+    // mkdirSync first, because the same GIT_TEMPLATE_DIR that makes this write
+    // necessary is what can make its parent absent: pointed at an empty or a
+    // non-existent directory, `git init` still succeeds but seeds no .git/info,
+    // and the bare write threw ENOENT before the fixture ran a single assertion
+    // (santifer, reviewing #2567). Assuming the default template here would be
+    // the same ambient-environment dependency this block exists to remove.
+    const excludePath = join(fixtureRoot, '.git', 'info', 'exclude');
+    mkdirSync(dirname(excludePath), { recursive: true });
+    writeFileSync(excludePath, '');
     gitRun(['config', 'core.symlinks', 'false']);
     gitRun(['config', 'core.excludesFile', emptyExcludes]);
     gitRun(['config', 'user.email', 'test@example.com']);
@@ -5374,6 +5955,69 @@ console.log('\n12c. Materialized skill index mode');
   }
 }
 
+// The block above pins the file layers and the runtime layer, but it can only
+// prove the pin holds against whatever the machine running it happens to carry.
+// On a clean machine an injected-config leak stays invisible, and the pin could
+// be removed with every assertion still green - which is how this one got in.
+// So inject the leak on purpose and assert the pin absorbs it (CodeRabbit,
+// reviewing #2567).
+{
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'career-ops-skill-gitinject-'));
+  const gitConfigRoot = mkdtempSync(join(tmpdir(), 'career-ops-skill-gitinject-cfg-'));
+  try {
+    const gitConfigPath = join(gitConfigRoot, 'gitconfig');
+    writeFileSync(gitConfigPath, '');
+    const emptyExcludes = join(gitConfigRoot, 'empty-excludes');
+    writeFileSync(emptyExcludes, '');
+    // The ignore rule an agent-tool user plausibly carries machine-wide, in the
+    // one layer GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM do not cover.
+    const ambientExcludes = join(gitConfigRoot, 'ambient-ignore');
+    writeFileSync(ambientExcludes, '.agents/\n');
+    // Through hermeticGitEnv, not around it: this asserts the production
+    // construction absorbs the injection, so dropping the pin there turns this
+    // red rather than leaving it green on a clean machine.
+    const gitEnv = hermeticGitEnv(gitConfigPath, {
+      ...process.env,
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.excludesFile',
+      GIT_CONFIG_VALUE_0: ambientExcludes,
+    });
+    const gitRun = (args) => execFileSync('git', args, {
+      cwd: fixtureRoot,
+      encoding: 'utf-8',
+      timeout: 30000,
+      env: gitEnv,
+    }).trim();
+
+    const canonicalDir = join(fixtureRoot, '.agents', 'skills', 'career-ops');
+    mkdirSync(canonicalDir, { recursive: true });
+    gitRun(['init']);
+    const excludePath = join(fixtureRoot, '.git', 'info', 'exclude');
+    mkdirSync(dirname(excludePath), { recursive: true });
+    writeFileSync(excludePath, '');
+    gitRun(['config', 'core.excludesFile', emptyExcludes]);
+    writeFileSync(join(canonicalDir, 'SKILL.md'), '---\nname: career-ops\n---\n');
+
+    let staged = '';
+    try {
+      gitRun(['add', '--', '.agents/skills/career-ops/SKILL.md']);
+      staged = gitRun(['ls-files', '--', '.agents/skills/career-ops/SKILL.md']);
+    } catch {
+      // Left empty: the assertion below is the report.
+    }
+    if (staged) {
+      pass('injected GIT_CONFIG_* core.excludesFile cannot reach the skill fixture (#2567)');
+    } else {
+      fail('injected GIT_CONFIG_* core.excludesFile reached the fixture - the runtime config layer is unpinned (#2567)');
+    }
+  } catch (e) {
+    fail(`injected git-config isolation test crashed: ${e.message}`);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+    rmSync(gitConfigRoot, { recursive: true, force: true });
+  }
+}
+
 // ── 14. VERSION FILE ─────────────────────────────────────────────
 
 console.log('\n14. Version file');
@@ -5431,6 +6075,21 @@ run(NODE, ['archive-posting.mjs']) !== null
   ? pass('no-args: exits 0 (shows help)')
   : fail('no-args: should exit 0 and print help');
 
+// argument validation: a trailing --report must not be dropped. It used to fall
+// through the parser and archive the posting with no report prefix — silently
+// unfindable, the exact failure --report exists to prevent.
+run(NODE, ['archive-posting.mjs', '--dry-run', 'https://boards.greenhouse.io/openai/jobs/123', '--report']) === null
+  ? pass('trailing --report: exits non-zero instead of archiving unkeyed')
+  : fail('trailing --report: should exit non-zero, not archive without a report prefix');
+
+// argument validation: both --report forms still key the capture
+for (const argv of [['--report', '4'], ['--report=4']]) {
+  const keyed = run(NODE, ['archive-posting.mjs', '--dry-run', 'https://boards.greenhouse.io/openai/jobs/123', ...argv]);
+  keyed?.includes('jds/004-')
+    ? pass(`${argv.join(' ')}: capture is keyed to the report`)
+    : fail(`${argv.join(' ')}: capture missing the 004- report prefix`);
+}
+
 // argument validation: flag without URL → exits non-zero
 run(NODE, ['archive-posting.mjs', '--dry-run']) === null
   ? pass('flag-without-url: exits non-zero (URL required)')
@@ -5440,6 +6099,33 @@ run(NODE, ['archive-posting.mjs', '--dry-run']) === null
 run(NODE, ['archive-posting.mjs', '--company=Acme']) === null
   ? pass('--company without URL: exits non-zero')
   : fail('--company without URL: should exit non-zero');
+
+// --report: keys the capture to a report number so it resolves on a later day (#134)
+const reportEqOut = run(NODE, ['archive-posting.mjs', '--dry-run', '--report=42', 'https://boards.greenhouse.io/openai/jobs/123']);
+reportEqOut?.includes('jds/042-')
+  ? pass('--report=N: filename carries the zero-padded report number')
+  : fail('--report=N: report prefix missing from filename');
+
+// The space-separated form must consume its value; otherwise the bare-argument
+// branch takes it as the URL and the real URL is silently dropped.
+const reportSpaceOut = run(NODE, ['archive-posting.mjs', '--dry-run', '--report', '42', 'https://boards.greenhouse.io/openai/jobs/123']);
+reportSpaceOut?.includes('jds/042-') && reportSpaceOut?.toLowerCase().includes('openai')
+  ? pass('--report N: value consumed, URL still parsed')
+  : fail('--report N: swallowed the URL or dropped the report number');
+
+// omitting --report leaves the historical filename shape untouched
+const noReportOut = run(NODE, ['archive-posting.mjs', '--dry-run', 'https://boards.greenhouse.io/openai/jobs/123']);
+noReportOut?.includes(`jds/${todayStr}_`)
+  ? pass('no --report: filename shape unchanged')
+  : fail('no --report: filename shape regressed');
+
+run(NODE, ['archive-posting.mjs', '--dry-run', '--report=abc', 'https://boards.greenhouse.io/openai/jobs/123']) === null
+  ? pass('--report with non-numeric value: exits non-zero')
+  : fail('--report with non-numeric value: should be rejected, not ignored');
+
+run(NODE, ['archive-posting.mjs', '--pipeline', '--report=42']) === null
+  ? pass('--report with --pipeline: rejected (report keys one posting)')
+  : fail('--report with --pipeline: should exit non-zero');
 
 // live render: gated behind Playwright executable availability
 let hasBrowser = false;
@@ -6872,6 +7558,98 @@ try {
   } else {
     fail('parseAppliedDate must not match inside "reapplied" even with a tilde');
   }
+  // #2607 — a note citing ANOTHER row's apply date must not win. Notes routinely
+  // reference a sibling requisition's timeline for context, and that citation
+  // reads exactly like this row's own date to a positional scan.
+  const crossRefNote =
+    'STRATEGY DECISION NEEDED: #154 Sr PM M&A is already live in the same ATS '
+    + '(applied 2026-08-04) - recommend applying anyway. TIER A flagship CV '
+    + 'required. APPLIED 2026-08-06 - submitted directly by Jason.';
+  if (cadence.parseAppliedDate(crossRefNote) === '2026-08-06') {
+    pass('parseAppliedDate ignores a date cited about another row (#2607)');
+  } else {
+    fail(`parseAppliedDate cross-reference: got ${JSON.stringify(cadence.parseAppliedDate(crossRefNote))}, want 2026-08-06`);
+  }
+  // The reference's scope ends at a sentence boundary — otherwise any note that
+  // mentions a sibling row would lose its own date.
+  if (cadence.parseAppliedDate('Sibling #140 was slow. Applied 2026-08-06.') === '2026-08-06') {
+    pass('parseAppliedDate: a sentence boundary ends the row-reference scope');
+  } else {
+    fail('parseAppliedDate should keep its own date after a sentence break');
+  }
+  // ...but a SEMICOLON is not a boundary: it joins independent clauses inside
+  // one sentence, so the subject carries across it and the date is still the
+  // referenced row's.
+  const semicolonRef = '#154 is already live; applied 2026-08-04. Not submitted here yet.';
+  if (cadence.parseAppliedDate(semicolonRef) === null) {
+    pass('parseAppliedDate: a semicolon does NOT end the scope of a reference that has no date yet');
+  } else {
+    fail(`parseAppliedDate semicolon scope: got ${JSON.stringify(cadence.parseAppliedDate(semicolonRef))}, want null`);
+  }
+  // ...but once the citation HAS been given its own date, a separator does end
+  // it, and what follows is this row's. This is the mixed shape #2610 review
+  // called out: the note names a sibling AND records this submission, which is
+  // the common case when two roles are live at one employer. Reading the whole
+  // note as the sibling's throws away a real measured date.
+  //
+  // It is also the pair a future simplification would silently re-break — the
+  // two cases differ only by whether a date precedes the separator, so they are
+  // asserted together on purpose.
+  for (const [note, want, why] of [
+    ['#154 Sr PM (applied 2026-08-04); applied 2026-06-15', '2026-06-15', 'semicolon, citation already dated'],
+    ['#154 Sr PM (applied 2026-08-04) | applied 2026-06-15', '2026-06-15', 'pipe, citation already dated'],
+    // No space after the separator. A full stop needs trailing whitespace to
+    // avoid firing on "3.5", but `;` and `|` never appear inside numbers, and a
+    // hand-typed note writes ";applied" as readily as "; applied".
+    ['#154 Sr PM (applied 2026-08-04);applied 2026-06-15', '2026-06-15', 'unspaced semicolon'],
+    ['#154 Sr PM (applied 2026-08-04)|applied 2026-06-15', '2026-06-15', 'unspaced pipe'],
+    ['#154 is already live;applied 2026-08-04.', null, 'unspaced separator, citation NOT yet dated'],
+    ['#154 Sr PM (applied 2026-08-04)', null, 'citation dated, nothing after it'],
+  ]) {
+    const got = cadence.parseAppliedDate(note);
+    if (got === want) pass(`parseAppliedDate: ${why} → ${JSON.stringify(want)}`);
+    else fail(`parseAppliedDate ${why}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+  }
+  // When EVERY apply-date belongs to another row, the note does not state this
+  // row's date. Degrade to the labelled evaluation-date fallback rather than
+  // report a real-but-foreign date as measured.
+  const onlyForeign = 'Same posting as #140 (applied 2026-07-20). Not yet submitted.';
+  if (cadence.parseAppliedDate(onlyForeign) === null) {
+    pass('parseAppliedDate returns null when every applied date is a cross-reference');
+  } else {
+    fail(`parseAppliedDate should not adopt a foreign date, got ${JSON.stringify(cadence.parseAppliedDate(onlyForeign))}`);
+  }
+  {
+    const r = cadence.resolveAppliedDate({ notes: onlyForeign, date: '2026-07-25' });
+    if (r.appliedDate === '2026-07-25' && r.appDateSource === 'evaluation-date-fallback') {
+      pass('resolveAppliedDate labels a cross-reference-only note as the evaluation-date fallback');
+    } else {
+      fail(`resolveAppliedDate cross-ref-only: got ${JSON.stringify(r)}`);
+    }
+  }
+  // A `#NNN` carrying a req/job/posting/ref label is THIS row's ATS identifier,
+  // not a pointer at another tracker row. Without this scoping the row's own
+  // posting id disqualified the row's own apply date — a false positive that
+  // costs a real measured date, so the extra rule earns its keep (#2610 review).
+  for (const [note, why] of [
+    ['Req #1311 - applied 2026-08-06.', 'req'],
+    ['Job ID #65136; applied 2026-08-06.', 'job id'],
+    ['Posting #4471 — applied 2026-08-06.', 'posting'],
+    ['Ref #R2857957 applied 2026-08-06.', 'ref'],
+  ]) {
+    if (cadence.parseAppliedDate(note) === '2026-08-06') {
+      pass(`parseAppliedDate reads a "${why}"-labelled #id as this row's own, not a cross-reference`);
+    } else {
+      fail(`parseAppliedDate "${why}"-labelled id: got ${JSON.stringify(cadence.parseAppliedDate(note))}, expected 2026-08-06`);
+    }
+  }
+  // ...and the exemption must not blunt the rule it scopes: a BARE #NNN in the
+  // same shape is still a cross-reference.
+  if (cadence.parseAppliedDate('Sibling #1311 - applied 2026-08-06.') === null) {
+    pass('parseAppliedDate still treats a bare #id in the same shape as a cross-reference');
+  } else {
+    fail('the req-label exemption swallowed a genuine cross-reference');
+  }
   // A malformed value must be rejected, not silently truncated to a plausible
   // date. Truncating "2026-06-091" to "2026-06-09" would be reported as a
   // measured application date and quietly shift the whole cadence — worse than
@@ -7059,6 +7837,15 @@ try {
       copyFileSync(join(ROOT, 'followup-cadence.mjs'), join(e2eTmp, 'followup-cadence.mjs'));
       copyFileSync(join(ROOT, 'tracker-parse.mjs'), join(e2eTmp, 'tracker-parse.mjs'));
       copyFileSync(join(ROOT, 'tracker-aliases.json'), join(e2eTmp, 'tracker-aliases.json'));
+      // followup-cadence now derives its status aliases from templates/states.yml
+      // via tracker-utils, so the fixture has to carry both — same reason
+      // tracker-aliases.json is copied for tracker-parse.mjs (#2704).
+      copyFileSync(join(ROOT, 'tracker-utils.mjs'), join(e2eTmp, 'tracker-utils.mjs'));
+      // ...and tracker-utils imports the shared lock-contention helpers
+      // (#2777 fix), so the fixture carries that import too.
+      copyFileSync(join(ROOT, 'pipeline-lock.mjs'), join(e2eTmp, 'pipeline-lock.mjs'));
+      mkdirSync(join(e2eTmp, 'templates'), { recursive: true });
+      copyFileSync(join(ROOT, 'templates', 'states.yml'), join(e2eTmp, 'templates', 'states.yml'));
       // 'junction' on Windows, not 'dir': a directory symlink needs
       // SeCreateSymbolicLinkPrivilege, which a normal shell lacks unless
       // Developer Mode is on, so this threw EPERM and failed the test on an
@@ -7524,15 +8311,48 @@ try {
     const cvPath = join(cliTmp, 'cv.md');
     const adPath = join(cliTmp, 'article-digest.md');
     writeFileSync(cvPath, '# CV\n\n## Projects\n\n- **Existing** (OSS) -- here\n');
-    const payloadPath = join(cliTmp, 'p.json');
-    writeFileSync(payloadPath, JSON.stringify({
+    const payloadPath = join(cliTmp, 'payload-with-dash.json');
+    const cliPayload = {
       cv: { section: 'Projects', dedupKey: 'CliProj', entry: '- **CliProj** (OSS) -- desc' },
       articleDigest: { dedupKey: 'CliProj', entry: '## CliProj -- Tagline\n\n**Hero metrics:** x' },
-    }));
+    };
+    writeFileSync(payloadPath, JSON.stringify(cliPayload));
     const env = { ...process.env, CAREER_OPS_CV: cvPath, CAREER_OPS_ARTICLE_DIGEST: adPath };
 
+    const helpOut = spawnSync(NODE, [join(ROOT, 'add-entry.mjs'), '--help'], { env, encoding: 'utf-8' });
+    const hOut = spawnSync(NODE, [join(ROOT, 'add-entry.mjs'), '-h'], { env, encoding: 'utf-8' });
+    if (helpOut.status === 0 && hOut.status === 0 &&
+        helpOut.stdout.includes('Usage:') && helpOut.stdout.includes('--stdin') &&
+        hOut.stdout === helpOut.stdout) {
+      pass('add-entry CLI --help/-h print usage and exit 0');
+    } else {
+      fail(`add-entry CLI help handling => ${JSON.stringify({ help: { status: helpOut.status, stdout: helpOut.stdout, stderr: helpOut.stderr }, h: { status: hOut.status, stdout: hOut.stdout, stderr: hOut.stderr } })}`);
+    }
+
+    const missingPayloadPath = join(cliTmp, 'missing-payload.json');
+    const badFlag = spawnSync(NODE, [join(ROOT, 'add-entry.mjs'), missingPayloadPath, '--sumary'], { env, encoding: 'utf-8' });
+    if (badFlag.status === 1 && badFlag.stderr.includes('--sumary') && badFlag.stderr.includes('Usage:') &&
+        !badFlag.stderr.includes('could not parse payload') &&
+        !readFileSync(cvPath, 'utf-8').includes('CliProj') && !existsSync(adPath)) {
+      pass('add-entry CLI rejects an unrecognized flag before reading or writing payload data');
+    } else {
+      fail(`add-entry CLI unknown flag handling => ${JSON.stringify({ status: badFlag.status, stdout: badFlag.stdout, stderr: badFlag.stderr })}`);
+    }
+
+    const stdinDryRun = spawnSync(NODE, [join(ROOT, 'add-entry.mjs'), '--stdin', '--dry-run'], {
+      env,
+      encoding: 'utf-8',
+      input: JSON.stringify(cliPayload),
+    });
+    if (stdinDryRun.status === 0 && JSON.parse(stdinDryRun.stdout).dryRun === true &&
+        !readFileSync(cvPath, 'utf-8').includes('CliProj') && !existsSync(adPath)) {
+      pass('add-entry CLI keeps --stdin and --dry-run working together');
+    } else {
+      fail(`add-entry CLI --stdin --dry-run => ${JSON.stringify({ status: stdinDryRun.status, stdout: stdinDryRun.stdout, stderr: stdinDryRun.stderr })}`);
+    }
+
     execFileSync(NODE, [join(ROOT, 'add-entry.mjs'), payloadPath, '--dry-run'], { env, encoding: 'utf-8' });
-    if (!readFileSync(cvPath, 'utf-8').includes('CliProj') && !existsSync(adPath)) pass('add-entry CLI --dry-run writes nothing');
+    if (!readFileSync(cvPath, 'utf-8').includes('CliProj') && !existsSync(adPath)) pass('add-entry CLI --dry-run writes nothing and accepts a payload path containing dashes');
     else fail('add-entry CLI --dry-run should not write');
 
     const realOut = JSON.parse(execFileSync(NODE, [join(ROOT, 'add-entry.mjs'), payloadPath], { env, encoding: 'utf-8' }));
@@ -7548,6 +8368,51 @@ try {
     else fail(`add-entry CLI re-run => ${JSON.stringify(rerun)}`);
   } finally {
     rmSync(cliTmp, { recursive: true, force: true });
+  }
+
+  // Non-Latin CVs (#2849). normalizeKey stripped [^a-z0-9], so every heading and
+  // dedupKey in a Japanese/Russian/Hindi CV keyed to '' — which made `add`
+  // UNUSABLE, not inaccurate: the non-empty-dedupKey guard rejected a key the
+  // user had supplied, and two different headings both keying to '' matched
+  // each other, so an entry could land under the wrong section.
+  {
+    const jpTmp = mkdtempSync(join(tmpdir(), 'career-ops-add-jp-'));
+    try {
+      const cvPath = join(jpTmp, 'cv.md');
+      writeFileSync(cvPath, '# CV\n\n## \u30D7\u30ED\u30B8\u30A7\u30AF\u30C8\n\n- \u65E2\u5B58\n\n## \u8077\u52D9\u7D4C\u6B74\n\n- \u65E2\u5B58\n');
+      const payloadPath = join(jpTmp, 'p.json');
+      writeFileSync(payloadPath, JSON.stringify({ cv: {
+        section: '\u30D7\u30ED\u30B8\u30A7\u30AF\u30C8',
+        dedupKey: '\u30D5\u30E9\u30A6\u30C9\u30B7\u30FC\u30EB\u30C9',
+        entry: '- **\u30D5\u30E9\u30A6\u30C9\u30B7\u30FC\u30EB\u30C9**',
+      } }));
+      const env = { ...process.env, CAREER_OPS_CV: cvPath };
+      const out = JSON.parse(execFileSync(NODE, [join(ROOT, 'add-entry.mjs'), payloadPath], { env, encoding: 'utf-8' }));
+      out.cv.status === 'added'
+        ? pass('add-entry: a non-Latin dedupKey is accepted and the entry is added (#2849)')
+        : fail(`add-entry: non-Latin payload => ${JSON.stringify(out.cv)}`);
+
+      const rerun = JSON.parse(execFileSync(NODE, [join(ROOT, 'add-entry.mjs'), payloadPath], { env, encoding: 'utf-8' }));
+      rerun.cv.status === 'duplicate'
+        ? pass('add-entry: a non-Latin entry is idempotent on re-run (#2849)')
+        : fail(`add-entry: non-Latin re-run => ${JSON.stringify(rerun.cv)}`);
+
+      // A different heading must not collide via a shared empty key.
+      const p2 = join(jpTmp, 'p2.json');
+      writeFileSync(p2, JSON.stringify({ cv: {
+        section: '\u8077\u52D9\u7D4C\u6B74',
+        dedupKey: '\u5225\u30D7\u30ED\u30B8\u30A7\u30AF\u30C8',
+        entry: '- **\u5225\u30D7\u30ED\u30B8\u30A7\u30AF\u30C8**',
+      } }));
+      execFileSync(NODE, [join(ROOT, 'add-entry.mjs'), p2], { env, encoding: 'utf-8' });
+      const finalCv = readFileSync(cvPath, 'utf-8');
+      const [projSection, workSection] = finalCv.split('## \u8077\u52D9\u7D4C\u6B74');
+      (workSection || '').includes('\u5225\u30D7\u30ED\u30B8\u30A7\u30AF\u30C8') && !projSection.includes('\u5225\u30D7\u30ED\u30B8\u30A7\u30AF\u30C8')
+        ? pass('add-entry: two different non-Latin sections stay distinct (#2849)')
+        : fail(`add-entry: entry landed under the wrong non-Latin section:\n${finalCv}`);
+    } finally {
+      rmSync(jpTmp, { recursive: true, force: true });
+    }
   }
 
 } catch (e) {
@@ -8036,6 +8901,95 @@ try {
   }
 } catch (e) {
   fail(`verify-pipeline report checks crashed: ${e.message}`);
+}
+
+// ── VERIFY-PIPELINE, THE ALPHABET THE FIXTURE ABOVE DOES NOT COVER ──────
+// The fixture above proves the duplicate MECHANISM works. Every string in it
+// is ASCII, so it cannot tell "the detector works" apart from "the detector
+// works for Latin names" — and the difference is not academic. `İ`.toLowerCase()
+// yields `i` + U+0307 (a combining dot that survives normalization), so
+// `İstanbul Tekstil` and `Istanbul Tekstil` key differently and the duplicate
+// goes UNDETECTED. That is the opposite failure to the one fixed in #2393,
+// where every non-Latin name collapsed to '' and everything collided: that was
+// loud and got fixed. This one is silent, and it is the integrity checker
+// itself that returns the green.
+//
+// THIS TEST PINS TODAY'S BEHAVIOR ON PURPOSE. It is not an endorsement: the
+// targeted fix (strip U+0307 after lowercasing) is measured and does NOT touch
+// Škoda/Nestlé/Zürich, but normalizeTextKey is a frozen contract surface with
+// eight production consumers plus the web mirror, so applying it is a
+// coordinated decision, not a drive-by. If you are here because this assertion
+// failed, you did not break anything: you changed that decision. Invert the
+// expectation, update tests/fixtures/company-key-corpus.json, and land it in
+// lockstep with the web.
+console.log('\n🧪 Testing verify-pipeline duplicate detection across alphabets...');
+try {
+  const tkTmp = mkdtempSync(join(tmpdir(), 'career-ops-verify-turkish-'));
+  try {
+    const tkReports = join(tkTmp, 'reports');
+    mkdirSync(tkReports, { recursive: true });
+    const tkTracker = join(tkTmp, 'applications.md');
+    const tkEnv = { ...process.env, CAREER_OPS_TRACKER: tkTracker, CAREER_OPS_REPORTS: tkReports };
+    const tkReport = (company, role) =>
+      `# Evaluación: ${company} — ${role}\n\n## Machine Summary\n\n\`\`\`yaml\ncompany: "${company}"\nrole: "${role}"\nscore: 4.0\n\`\`\`\n`;
+
+    // Same employer, same role, two spellings a Turkish user types interchangeably.
+    writeFileSync(join(tkReports, '001-istanbul-2026-02-01.md'), tkReport('İstanbul Tekstil', 'Yazılım Mühendisi'));
+    writeFileSync(join(tkReports, '002-istanbul-2026-02-02.md'), tkReport('Istanbul Tekstil', 'Yazılım Mühendisi'));
+    writeFileSync(tkTracker,
+      '# Applications Tracker\n\n' +
+      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      '| 1 | 2026-02-01 | İstanbul Tekstil | Yazılım Mühendisi | 4.0/5 | Evaluated | ❌ | [1](reports/001-istanbul-2026-02-01.md) | ok |\n' +
+      '| 2 | 2026-02-02 | Istanbul Tekstil | Yazılım Mühendisi | 4.0/5 | Evaluated | ❌ | [2](reports/002-istanbul-2026-02-02.md) | ok |\n');
+
+    const tkOut = run(NODE, ['verify-pipeline.mjs'], { env: tkEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    if (tkOut === null) {
+      fail('verify-pipeline crashed on the Turkish dotted-I fixture');
+    } else {
+      // Check 2 reads the tracker's own Company column, where the two spellings
+      // survive intact, so this is the one the dotted I blinds.
+      // Decision changed 12-ago (Santiago): the targeted fix landed, so the
+      // tracker check now folds the dotted I and DOES catch the duplicate.
+      // Left pinned in the opposite direction so a revert is loud.
+      if (/Possible duplicates/.test(tkOut)) {
+        pass('tracker dup check (Check 2) now folds the dotted I and catches the duplicate');
+      } else {
+        fail('dotted-I tracker duplicate no longer detected: the targeted fix regressed (see company-key-corpus.json)');
+      }
+      // …while Check 9 groups reports by the FILENAME slug, which is already
+      // ASCII by the time a report is written, so it flags the very same pair.
+      // The comment above `const normalizeKey = normalizeTextKey` promises the
+      // two checks "can never disagree about whether two roles are the same".
+      // They can, and here they do: sharing the function is not sharing the
+      // INPUT. Pinned so the contradiction is visible in CI instead of living
+      // only in a maintainer's notes.
+      if (/Duplicate reports[^\n]*001-istanbul/.test(tkOut)) {
+        pass('report dup check (Check 9) DOES flag the same pair — the two checks disagree, contrary to the guarantee written at its definition');
+      } else {
+        fail('Check 9 no longer flags the pair: the two checks now agree, so update the note at `const normalizeKey = normalizeTextKey`');
+      }
+    }
+    // The control that makes the assertions above mean something: within one
+    // spelling the tracker check must still fire, or "not detected" would prove
+    // nothing about the alphabet and everything about a broken fixture.
+    writeFileSync(tkTracker,
+      '# Applications Tracker\n\n' +
+      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      '| 1 | 2026-02-01 | İstanbul Tekstil | Yazılım Mühendisi | 4.0/5 | Evaluated | ❌ | [1](reports/001-istanbul-2026-02-01.md) | ok |\n' +
+      '| 2 | 2026-02-02 | İstanbul Tekstil | Yazılım Mühendisi | 4.0/5 | Evaluated | ❌ | [2](reports/002-istanbul-2026-02-02.md) | ok |\n');
+    const tkCtl = run(NODE, ['verify-pipeline.mjs'], { env: tkEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    if (tkCtl !== null && /Possible duplicates/.test(tkCtl)) {
+      pass('same-spelling Turkish duplicate IS caught by Check 2 (control: the fixture exercises the real path)');
+    } else {
+      fail('control failed: two identical Turkish rows were not flagged, so the fixture proves nothing');
+    }
+  } finally {
+    rmSync(tkTmp, { recursive: true, force: true });
+  }
+} catch (e) {
+  fail(`verify-pipeline alphabet checks crashed: ${e.message}`);
 }
 
 // ── VERIFY-PIPELINE ORPHAN REFERENCE RESOLUTION (#1425 follow-up) ────────────
@@ -8589,6 +9543,114 @@ try {
   fail(`shared role matcher / dedup safety tests crashed: ${e.message}`);
 }
 
+// ── DEDUP FLAG VALIDATION (#2744) ─────────────────────────────────────────
+// Any argv token dedup-tracker.mjs didn't recognize used to fall straight
+// through: DRY_RUN stayed false and the script ran its real, destructive
+// merge-and-write pass. `--check` (a plausible-sounding typo for --dry-run)
+// happened for real. Same shape as scan-ats-full.mjs (#1633/#1635).
+console.log('\n🧪 Testing dedup-tracker flag validation (#2744)...');
+try {
+  const flagTmp = mkdtempSync(join(tmpdir(), 'career-ops-dedup-flags-'));
+  try {
+    mkdirSync(join(flagTmp, 'data'));
+    const tracker = join(flagTmp, 'data', 'applications.md');
+    const seedTracker =
+      '# Applications Tracker\n\n' +
+      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      '| 1 | 2026-01-08 | FlagCo | Engineer | 3.9/5 | Evaluated | ❌ | [1](../reports/001-flagco.md) | first row |\n' +
+      '| 1 | 2026-01-09 | FlagCo | Engineer | 4.2/5 | Evaluated | ❌ | [2](../reports/002-flagco.md) | exact duplicate |\n';
+    const env = { ...process.env, CAREER_OPS_TRACKER: tracker };
+
+    // --help / -h: print usage, exit 0, do not touch the tracker.
+    writeFileSync(tracker, seedTracker);
+    const helpResult = run(NODE, ['dedup-tracker.mjs', '--help'], { env });
+    if (helpResult !== null && /Usage:.*dedup-tracker\.mjs/.test(helpResult)) {
+      pass('dedup-tracker --help prints usage and exits 0');
+    } else {
+      fail(`dedup-tracker --help should print usage and exit 0, got: ${JSON.stringify(helpResult)}`);
+    }
+    if (readFileSync(tracker, 'utf-8') === seedTracker) {
+      pass('dedup-tracker --help does not run the dedup/write pass');
+    } else {
+      fail('dedup-tracker --help mutated the tracker — it must exit before any write path');
+    }
+
+    const hResult = run(NODE, ['dedup-tracker.mjs', '-h'], { env });
+    if (hResult !== null && /Usage:.*dedup-tracker\.mjs/.test(hResult)) {
+      pass('dedup-tracker -h prints usage and exits 0');
+    } else {
+      fail(`dedup-tracker -h should print usage and exit 0, got: ${JSON.stringify(hResult)}`);
+    }
+
+    // Unrecognized flag (the #2744 repro: --check, a plausible typo for
+    // --dry-run): must error, exit 1, and — critically — never reach the
+    // write path.
+    writeFileSync(tracker, seedTracker);
+    const checkResult = run(NODE, ['dedup-tracker.mjs', '--check'], { env });
+    const checkFailure = lastRunFailure();
+    if (checkResult === null && checkFailure?.status === 1 && /unrecognized flag/i.test(checkFailure.stderr)) {
+      pass('dedup-tracker --check (unrecognized flag) errors and exits 1 (#2744 repro)');
+    } else {
+      fail(`dedup-tracker --check should error and exit 1 with an "unrecognized flag" message: ${formatRunFailure()}`);
+    }
+    if (readFileSync(tracker, 'utf-8') === seedTracker) {
+      pass('dedup-tracker --check does NOT run the live write path — tracker untouched (#2744)');
+    } else {
+      fail('dedup-tracker --check mutated the tracker — the #2744 bug is still live');
+    }
+
+    // CodeRabbit (#2746): --help combined with an unrecognized flag must
+    // still reject — unknown-flag validation has to run before --help
+    // short-circuits, otherwise `dedup-tracker.mjs --help --check` would
+    // exit 0 instead of erroring.
+    writeFileSync(tracker, seedTracker);
+    const mixedResult = run(NODE, ['dedup-tracker.mjs', '--help', '--check'], { env });
+    const mixedFailure = lastRunFailure();
+    if (mixedResult === null && mixedFailure?.status === 1 && /unrecognized flag/i.test(mixedFailure.stderr)
+        && !/Usage:/.test(mixedFailure.stdout || '')) {
+      pass('dedup-tracker --help --check still rejects the unrecognized flag (#2746)');
+    } else {
+      fail(`dedup-tracker --help+--check should still error, not exit clean: ${formatRunFailure()}`);
+    }
+    if (readFileSync(tracker, 'utf-8') === seedTracker) {
+      pass('dedup-tracker --help --check does NOT run the live write path — tracker untouched (#2746)');
+    } else {
+      fail('dedup-tracker --help --check mutated the tracker — the #2746 ordering bug is still live');
+    }
+
+    // Regression: --dry-run must still work exactly as before (previews,
+    // does not write).
+    writeFileSync(tracker, seedTracker);
+    const dryRunResult = run(NODE, ['dedup-tracker.mjs', '--dry-run'], { env });
+    if (dryRunResult === null) {
+      fail('dedup-tracker.mjs --dry-run crashed after the flag-validation fix');
+    } else if (readFileSync(tracker, 'utf-8') === seedTracker) {
+      pass('dedup-tracker --dry-run still previews without writing (regression)');
+    } else {
+      fail('dedup-tracker --dry-run wrote to the tracker — regression');
+    }
+
+    // Regression: no-flags (real run) must still merge the exact duplicate.
+    writeFileSync(tracker, seedTracker);
+    const liveResult = run(NODE, ['dedup-tracker.mjs'], { env });
+    if (liveResult === null) {
+      fail('dedup-tracker.mjs (no flags) crashed after the flag-validation fix');
+    } else {
+      const engineerRows = readFileSync(tracker, 'utf-8').split('\n').filter(l => l.includes('| Engineer |'));
+      if (engineerRows.length === 1 && engineerRows[0].includes('4.2/5')) {
+        pass('dedup-tracker (no flags) still merges an exact duplicate live (regression)');
+      } else {
+        fail(`dedup-tracker (no flags) live-run regression: ${engineerRows.length} Engineer rows`);
+      }
+    }
+  } finally {
+    rmSync(flagTmp, { recursive: true, force: true });
+  }
+} catch (e) {
+  fail(`dedup-tracker flag validation tests crashed: ${e.message}`);
+}
+
 // ── DEDUP BLIND-VIA CHANNEL KEY: NON-LATIN AGENCIES (#2393) ──────────────
 // Unknown-employer rows (Company `?`) group by their Via channel. dedup-tracker
 // keyed that group with the file-local normalizeCompany(), which strips
@@ -9125,6 +10187,122 @@ try {
   fail(`merge-tracker fuzzy dedup tests crashed: ${e.message}`);
 }
 
+// buildRow used to emit rows from a hardcoded column list (num/date/company/
+// [via]/role/[location]/score/status/pdf/report/notes/[url]), ignoring the
+// actual header width. On a customized tracker with extra columns (e.g.
+// `… | Materials | Apply Link | Follow-up | Notes`) every merged row came out
+// NARROWER than the header, so header-driven readers (set-status.mjs) could no
+// longer parse them: the row's status became unaddressable through the
+// supported write path. Rows must round-trip at the header's exact width, with
+// unmapped cells as '—' and the report link preserved in Notes when the layout
+// has no Report column.
+console.log('\n🧪 Testing merge-tracker custom header width (extra columns, no Report column)...');
+try {
+  const widthTmp = mkdtempSync(join(tmpdir(), 'career-ops-width-'));
+  try {
+    mkdirSync(join(widthTmp, 'data'));
+    mkdirSync(join(widthTmp, 'reports'));
+    const additionsDir = join(widthTmp, 'additions');
+    mkdirSync(additionsDir);
+    const tracker = join(widthTmp, 'data', 'applications.md');
+    writeFileSync(tracker,
+      '# Applications Tracker\n\n' +
+      '| # | Date | Company | Role | Score | Status | Materials | Apply Link | Follow-up | Notes |\n' +
+      '|---|------|---------|------|-------|--------|-----------|------------|-----------|-------|\n' +
+      '| 1 | 2026-01-04 | StreamCo | Platform Engineer | 4.4/5 | Applied | ✅ | https://apply.example/1 | 2026-01-12 | existing |\n');
+    for (const n of ['003-acme-2026-01-05', '004-acme-2026-01-06']) {
+      writeFileSync(join(widthTmp, 'reports', `${n}.md`), '# fixture\n');
+    }
+    writeFileSync(join(additionsDir, '003-acme.tsv'),
+      '3\t2026-01-05\tAcme\tData Engineer\tEvaluated\t4.6/5\t❌\t[3](reports/003-acme-2026-01-05.md)\tnew eval\n');
+
+    const widthEnv = { ...process.env, CAREER_OPS_TRACKER: tracker, CAREER_OPS_ADDITIONS: additionsDir };
+    const widthResult = run(NODE, ['merge-tracker.mjs'], { env: widthEnv });
+    if (widthResult === null) {
+      fail('merge-tracker.mjs crashed on a 10-column custom-header tracker');
+    } else {
+      const lines = readFileSync(tracker, 'utf-8').split('\n').filter(l => l.startsWith('|'));
+      const headerWidth = lines[0].split('|').length;
+      const acmeRow = lines.find(l => l.includes('Acme'));
+
+      if (acmeRow && acmeRow.split('|').length === headerWidth) {
+        pass('merged row matches the header’s exact column count');
+      } else {
+        fail(`merged row width ${acmeRow ? acmeRow.split('|').length : 'n/a'} != header width ${headerWidth} (row: ${acmeRow})`);
+      }
+
+      const cells = acmeRow ? acmeRow.split('|').map(s => s.trim()) : [];
+      // Header-derived positions: 5=Score, 6=Status, 7=Materials(pdf), 8=Apply Link, 9=Follow-up, 10=Notes.
+      if (cells[5] === '4.6/5' && cells[6] === 'Evaluated') {
+        pass('score and status landed in their header-declared columns');
+      } else {
+        fail(`score/status misplaced: score cell='${cells[5]}', status cell='${cells[6]}'`);
+      }
+
+      if (cells[8] === '—' && cells[9] === '—') {
+        pass('columns career-ops has no field for are written as "—"');
+      } else {
+        fail(`unmapped columns not '—': apply link='${cells[8]}', follow-up='${cells[9]}'`);
+      }
+
+      // The merge normalizes the link relative to the tracker's directory
+      // (data/ → ../reports/…), so match on label + filename, not the raw TSV path.
+      if (/\[3\]\([^)]*reports\/003-acme-2026-01-05\.md\)/.test(cells[10] || '')) {
+        pass('report link preserved in Notes when the layout has no Report column');
+      } else {
+        fail(`report link dropped: notes cell='${cells[10]}'`);
+      }
+
+      // Round-trip half: a re-evaluation of the same report must UPDATE the row
+      // it just wrote (extractReportNum falls back to the Notes-embedded link),
+      // not append a duplicate.
+      writeFileSync(join(additionsDir, '003-acme-reeval.tsv'),
+        '3\t2026-01-06\tAcme\tData Engineer\tEvaluated\t4.8/5\t❌\t[3](reports/003-acme-2026-01-05.md)\tre-eval\n');
+      const rerun = run(NODE, ['merge-tracker.mjs'], { env: widthEnv });
+      if (rerun === null) {
+        fail('merge-tracker.mjs crashed on re-evaluation against a Notes-embedded report link');
+      } else {
+        const after = readFileSync(tracker, 'utf-8').split('\n').filter(l => l.includes('Acme'));
+        if (after.length === 1 && after[0].includes('4.8/5')) {
+          pass('re-evaluation updated the row via the Notes-embedded report link (no duplicate)');
+        } else {
+          fail(`re-evaluation dedup broken: ${after.length} Acme rows, expected 1 updated to 4.8/5`);
+        }
+      }
+
+      // Rebuild-preservation half: updating an EXISTING row must keep the
+      // user-entered values in columns career-ops has no field for (the
+      // seeded StreamCo row carries an Apply Link URL and a Follow-up date).
+      // Without seeding from the row's current cells, the '—' fill would
+      // wipe both on every update.
+      writeFileSync(join(additionsDir, '004-streamco.tsv'),
+        '4\t2026-01-07\tStreamCo\tPlatform Engineer\tEvaluated\t4.7/5\t❌\t[4](reports/004-acme-2026-01-06.md)\tre-eval of seeded row\n');
+      const preserveRun = run(NODE, ['merge-tracker.mjs'], { env: widthEnv });
+      if (preserveRun === null) {
+        fail('merge-tracker.mjs crashed while updating a row with populated custom columns');
+      } else {
+        const scRows = readFileSync(tracker, 'utf-8').split('\n').filter(l => l.includes('StreamCo'));
+        // Cell-exact assertions, not whole-row substrings: they prove each value
+        // sits in ITS OWN header-declared column (a substring match would pass
+        // with the URL shifted under the wrong header — the very bug this suite
+        // guards), and an exact equality is not URL substring "sanitization",
+        // which CodeQL rightly flags as a tainted pattern to copy.
+        const scCells = scRows.length === 1 ? scRows[0].split('|').map(s => s.trim()) : [];
+        if (scRows.length === 1 && scCells[5] === '4.7/5'
+            && scCells[8] === 'https://apply.example/1' && scCells[9] === '2026-01-12') {
+          pass('update preserved user-entered Apply Link and Follow-up cells');
+        } else {
+          fail(`custom-column values lost on update: ${scRows[0]}`);
+        }
+      }
+    }
+  } finally {
+    rmSync(widthTmp, { recursive: true, force: true });
+  }
+} catch (e) {
+  fail(`merge-tracker custom header width tests crashed: ${e.message}`);
+}
+
 // merge-tracker used to clobber an Applied row when a sibling req's only
 // distinguishing qualifier was a slashed acronym: "(CI/CD)" tokenized to
 // nothing, the fuzzy tier matched, and the update path rewrote the existing
@@ -9325,6 +10503,176 @@ try {
   }
 } catch (e) {
   fail(`non-Latin via guard tests crashed: ${e.message}`);
+}
+
+// ── GO STATUS LITERALS MUST BE states.yml ALIASES (#2704) ─────────
+// The Go dashboard's NormalizeStatus grew its own, larger alias table: it knew
+// every Turkish spelling while states.yml did not, so ONE tracker row
+// normalized three different ways — the TUI read `Mülakat` as interview, the
+// core left it as `mülakat` (matching no ACTIONABLE/ADVANCED set, so the row
+// vanished from the funnel), and the web rejected it on writeback. We ship
+// modes/tr/, so this was live for Turkish users.
+//
+// Guard the direction that actually drifts: every status literal Go matches on
+// must be resolvable through states.yml. Go may still hold MORE matching logic
+// (it uses substring Contains for some), but it must not know a spelling the
+// source of truth has never heard of.
+console.log('\n🧪 Testing Go status literals against states.yml (#2704)...');
+try {
+  const { loadCanonicalStates } = await import(pathToFileURL(join(ROOT, 'tracker-utils.mjs')).href);
+  const states = loadCanonicalStates(join(ROOT, 'templates', 'states.yml'));
+  const known = new Set();
+  for (const st of states) {
+    known.add(st.id.toLowerCase());
+    if (st.label) known.add(st.label.toLowerCase());
+    for (const a of st.aliases) known.add(String(a).toLowerCase());
+  }
+
+  const goPath = join(ROOT, 'dashboard', 'internal', 'data', 'career.go');
+  if (!existsSync(goPath)) {
+    pass('dashboard/internal/data/career.go absent — Go status guard skipped');
+  } else {
+    const go = readFileSync(goPath, 'utf-8');
+    const fnStart = go.indexOf('func NormalizeStatus');
+    const body = fnStart === -1 ? '' : go.slice(fnStart, go.indexOf('\nfunc ', fnStart + 1));
+    // Only the literals used for status matching (== or Contains), not any
+    // other string in the function.
+    const literals = [...body.matchAll(/(?:s == |Contains\(s, )"([^"]+)"/g)].map((m) => m[1].toLowerCase());
+    const unknown = [...new Set(literals)].filter((l) => !known.has(l));
+    if (literals.length === 0) {
+      fail('could not extract any status literals from Go NormalizeStatus — the guard is not actually checking anything (#2704)');
+    } else if (unknown.length === 0) {
+      pass(`every Go status literal (${new Set(literals).size}) resolves through states.yml (#2704)`);
+    } else {
+      fail(`Go NormalizeStatus knows spellings states.yml does not — add them to templates/states.yml: ${unknown.join(', ')}`);
+    }
+  }
+} catch (e) {
+  fail(`Go status literal guard crashed: ${e.message}`);
+}
+
+// ── TURKISH DOTTED-CAPITAL CASING (#2704 review) ──────────────────
+// JS lowercases `İ` (U+0130) to `i` + COMBINING DOT ABOVE (U+0307) and the mark
+// survives, so `TEKLİF` became `tekli\u0307f` and matched no alias. Uppercase
+// status words are ordinary in Turkish, so every all-caps Turkish row missed.
+// foldStatusInput drops U+0307 after lowercasing, which repairs 31 of the 32
+// affected spellings at once; the 32nd (`İŞE ALINDI`, where dotless `ı`
+// uppercases to `I` and lowercases back to dotted `i`) is covered by an alias.
+console.log('\n🧪 Testing Turkish uppercase status resolution (#2704)...');
+try {
+  const { loadCanonicalStates, foldStatusInput } = await import(pathToFileURL(join(ROOT, 'tracker-utils.mjs')).href);
+  const { normalizeStatus: cadenceNorm } = await import(pathToFileURL(join(ROOT, 'followup-cadence.mjs')).href);
+  const states = loadCanonicalStates(join(ROOT, 'templates', 'states.yml'));
+
+  // The fold must not be able to collapse two different states: no canonical
+  // id/label/alias may itself contain U+0307.
+  const marked = [];
+  for (const st of states) {
+    for (const v of [st.id, st.label, ...st.aliases]) {
+      if (String(v).normalize('NFD').includes('\u0307')) marked.push(`${st.id}:${v}`);
+    }
+  }
+  marked.length === 0
+    ? pass('no canonical state value carries U+0307, so the fold cannot merge two states (#2704)')
+    : fail(`a canonical value contains U+0307 — folding it could collapse states: ${marked.join(', ')}`);
+
+  // Every value, in every casing a user can produce, resolves to its own state.
+  const misses = [];
+  for (const st of states) {
+    for (const v of [st.id, st.label, ...st.aliases]) {
+      for (const typed of [String(v), String(v).toLocaleUpperCase('tr'), String(v).toUpperCase()]) {
+        if (cadenceNorm(typed) !== st.id) misses.push(`${JSON.stringify(typed)}->${cadenceNorm(typed)} (want ${st.id})`);
+      }
+    }
+  }
+  misses.length === 0
+    ? pass('every state resolves from its as-written, Turkish-uppercase and plain-uppercase spellings (#2704)')
+    : fail(`${misses.length} spelling(s) do not resolve: ${misses.slice(0, 6).join(', ')}`);
+
+  // The specific reproductions from the review.
+  const cases = [['TEKLİF', 'offer'], ['DEĞERLENDİRİLDİ', 'evaluated'], ['KABUL EDİLDİ', 'hired'], ['İŞE ALINDI', 'hired']];
+  const wrong = cases.filter(([raw, want]) => cadenceNorm(raw) !== want);
+  wrong.length === 0
+    ? pass('the all-caps Turkish cases from the #2704 review resolve correctly')
+    : fail(`all-caps Turkish still failing: ${wrong.map(([r, w]) => `${r}->${cadenceNorm(r)} (want ${w})`).join(', ')}`);
+
+  // PAIR SEMANTICS, not implementation. The assertions above prove the fold
+  // repairs Turkish; they say nothing about what else it reaches. 462d2765
+  // shipped this same fold as NFD -> strip -> NFC on the company key, which
+  // also decomposed the PRECOMPOSED dots of z-dot, e-dot and g-dot and
+  // collapsed Zubr/Zubr, Eme/Eme and Generali/Generali -- Polish, Lithuanian
+  // and Maltese losing a distinction with every existing test still green
+  // (undone in 5df43e7). The status fold carried the identical defect; these
+  // pin the OUTCOME rather than the implementation.
+  {
+    const pairs = [
+      ['TEKL\u0130F', 'teklif', true, 'Turkish dotted capital: the dot is a casing artifact'],
+      ['KABUL ED\u0130LD\u0130', 'kabul edildi', true, 'same artifact, multi-word'],
+      ['\u017Bubr', 'Zubr', false, 'Polish z-dot: the dot is a letter the user typed'],
+      ['\u0116m\u0117', 'Eme', false, 'Lithuanian e-dot: same class'],
+      ['\u0120enerali', 'Generali', false, 'Maltese g-dot'],
+      ['\u0160koda', 'Skoda', false, 'caron typed by the user'],
+      ['Nestl\u00E9', 'Nestle', false, 'accent typed by the user'],
+    ];
+    const wrong = pairs.filter(([a, b, mustMatch]) => (foldStatusInput(a) === foldStatusInput(b)) !== mustMatch);
+    wrong.length === 0
+      ? pass('foldStatusInput folds the casing artifact only - typed dots and accents still separate (#2704)')
+      : fail(`foldStatusInput pair semantics wrong: ${wrong.map(([a, b, m]) => `${a}/${b} expected ${m ? 'match' : 'differ'}`).join('; ')}`);
+  }
+
+  foldStatusInput('TEKLİF') === 'teklif'
+    ? pass('foldStatusInput strips the combining dot JS introduces (#2704)')
+    : fail(`foldStatusInput('TEKLİF') = ${JSON.stringify(foldStatusInput('TEKLİF'))}, expected "teklif"`);
+} catch (e) {
+  fail(`Turkish casing guard crashed: ${e.message}`);
+}
+
+// ── ROLE TITLES IN NON-LATIN SCRIPTS (#2781) ──────────────────────
+// roleTokens ran an [a-z0-9\s] strip, so every non-Latin role title tokenized
+// to []. merge-tracker's dedup then never matched two spellings of the SAME
+// role at the same company, and a re-evaluation was appended as a duplicate row
+// instead of updating the existing one — while the Latin equivalent merged
+// cleanly. normalizeTitle also stripped every \p{Mn}, folding Devanagari
+// matras, Cyrillic breve and Japanese dakuten onto their bases.
+console.log('\n🧪 Testing role tokenization across scripts (#2781)...');
+try {
+  const { roleTokens, roleFuzzyMatch } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
+
+  const empty = ['\u0411\u044D\u043A\u0435\u043D\u0434-\u0440\u0430\u0437\u0440\u0430\u0431\u043E\u0442\u0447\u0438\u043A', '\u0938\u0949\u092B\u094D\u091F\u0935\u0947\u092F\u0930 \u0907\u0902\u091C\u0940\u0928\u093F\u092F\u0930'].filter((t) => roleTokens(t).length === 0);
+  empty.length === 0
+    ? pass('space-separated non-Latin role titles produce tokens (#2781)')
+    : fail(`role titles still tokenize to nothing: ${empty.join(', ')}`);
+
+  const samePairs = [
+    ['Backend Engineer, Payments', 'Backend Engineer (Payments)'],
+    ['\u0411\u044D\u043A\u0435\u043D\u0434-\u0440\u0430\u0437\u0440\u0430\u0431\u043E\u0442\u0447\u0438\u043A, \u043F\u043B\u0430\u0442\u0435\u0436\u0438', '\u0411\u044D\u043A\u0435\u043D\u0434-\u0440\u0430\u0437\u0440\u0430\u0431\u043E\u0442\u0447\u0438\u043A (\u043F\u043B\u0430\u0442\u0435\u0436\u0438)'],
+  ];
+  const notMatched = samePairs.filter(([a, b]) => !roleFuzzyMatch(a, b));
+  notMatched.length === 0
+    ? pass('the same role written with different punctuation matches in every script (#2781)')
+    : fail(`same-role pairs did not match: ${notMatched.map(([a]) => a).join('; ')}`);
+
+  const diffPairs = [
+    ['Backend Engineer', 'Data Scientist'],
+    ['\u0411\u044D\u043A\u0435\u043D\u0434-\u0440\u0430\u0437\u0440\u0430\u0431\u043E\u0442\u0447\u0438\u043A', '\u0410\u043D\u0430\u043B\u0438\u0442\u0438\u043A \u0434\u0430\u043D\u043D\u044B\u0445'],
+  ];
+  const wronglyMatched = diffPairs.filter(([a, b]) => roleFuzzyMatch(a, b));
+  wronglyMatched.length === 0
+    ? pass('different roles stay distinct in every script (#2781)')
+    : fail(`widening merged different roles: ${wronglyMatched.map(([a, b]) => `${a}/${b}`).join('; ')}`);
+
+  // Marks that carry meaning survive; Latin accent-folding is unchanged (#2209).
+  const marks = [
+    ['\u0915\u0902\u092A\u0928\u0940', '\u0915\u092A\u0928\u0940', false, 'Devanagari matra'],
+    ['\u0419\u043E\u0433\u0443\u0440\u0442', '\u0418\u043E\u0433\u0443\u0440\u0442', false, 'Cyrillic breve'],
+    ['S\u00EAnior Backend Engineer', 'Senior Backend Engineer', true, 'Latin accent folding (#2209)'],
+  ];
+  const markWrong = marks.filter(([a, b, must]) => (roleTokens(a).join(' ') === roleTokens(b).join(' ')) !== must);
+  markWrong.length === 0
+    ? pass('meaningful marks survive while Latin accents still fold (#2781)')
+    : fail(`mark handling wrong: ${markWrong.map(([a, b, m, why]) => `${a}/${b} expected ${m ? 'same' : 'different'} (${why})`).join('; ')}`);
+} catch (e) {
+  fail(`role tokenization guard crashed: ${e.message}`);
 }
 
 // ── MERGE-TRACKER: DISTINCT NON-LATIN COMPANIES (#2429) ───────────
@@ -9622,6 +10970,61 @@ try {
     pass('merge-tracker applies pdf-index.tsv to a newly merged tracker row in the same run');
   } else {
     fail('merge-tracker left a newly merged row at ❌ despite a matching pdf-index.tsv entry');
+  }
+
+  // A re-evaluation REPLACES the row's report link, and the PDF flag describes
+  // that report. Inheriting the old flag across the change carried the
+  // superseded report's ✅ onto a report with no PDF: the row then claimed a
+  // tailored CV exists, and the only PDF on disk belonged to the evaluation
+  // that had just been superseded (#2594).
+  const reevalRow = '| 3 | 2026-01-04 | Acme | Backend Engineer, Payments | 4.5/5 | Evaluated | ✅ | [1](../reports/001-acme-2026-01-04.md) | first |';
+  const reevalTsv = (n) => ({
+    name: `00${n}-acme.tsv`,
+    content: `${n}\t2026-02-01\tAcme\tBackend Engineer, Payments\tEvaluated\t3.9/5\t❌\t[${n}](reports/00${n}-acme-2026-02-01.md)\tre-eval\n`,
+  });
+
+  const staleFlag = runPdfSyncFixture(
+    'reeval-stale',
+    reevalRow,
+    '# report\tpdf\thtml\tformat\tdate\n1\toutput/acme-1.pdf\t\t\t2026-01-04\n',
+    [reevalTsv(2)],
+  );
+  const staleRow = staleFlag.merged.split('\n').find((l) => l.startsWith('| 3 ')) || '';
+  if (staleFlag.result !== null && /\[2\]/.test(staleRow) && staleRow.split('|')[7].trim() === '❌') {
+    pass('a re-eval that changes the report clears a ✅ the new report has no PDF for (#2594)');
+  } else {
+    fail(`stale PDF flag survived a report change: ${staleRow.trim()}`);
+  }
+
+  // The `—`-to-`[2]` variant. extractReportNum returns null for `—`, so a guard
+  // demanding BOTH sides be truthy fell straight back to duplicate.pdf and
+  // inherited the stale ✅ exactly as before the fix. A `—` row carrying a ✅ is
+  // ordinary — it is a tracker entry added before its evaluation (#2594 review).
+  const dashRow = '| 4 | 2026-01-04 | Acme | Backend Engineer, Payments | 4.5/5 | Evaluated | ✅ | — | backfilled |';
+  const dashFlag = runPdfSyncFixture(
+    'reeval-dash',
+    dashRow,
+    '# report\tpdf\thtml\tformat\tdate\n',
+    [reevalTsv(2)],
+  );
+  const dashResult = dashFlag.merged.split('\n').find((l) => l.startsWith('| 4 ')) || '';
+  if (dashFlag.result !== null && /\[2\]/.test(dashResult) && dashResult.split('|')[7].trim() === '❌') {
+    pass('a re-eval from a report-less (—) row clears the inherited ✅ too (#2594)');
+  } else {
+    fail(`stale PDF flag survived a —-to-[2] report change: ${dashResult.trim()}`);
+  }
+
+  const keptFlag = runPdfSyncFixture(
+    'reeval-kept',
+    reevalRow,
+    '# report\tpdf\thtml\tformat\tdate\n1\toutput/acme-1.pdf\t\t\t2026-01-04\n2\toutput/acme-2.pdf\t\t\t2026-02-01\n',
+    [reevalTsv(2)],
+  );
+  const keptRow = keptFlag.merged.split('\n').find((l) => l.startsWith('| 3 ')) || '';
+  if (keptFlag.result !== null && /\[2\]/.test(keptRow) && keptRow.split('|')[7].trim() === '✅') {
+    pass('a re-eval keeps ✅ when the NEW report does have a generated PDF (#2594)');
+  } else {
+    fail(`re-eval wrongly cleared a valid PDF flag: ${keptRow.trim()}`);
   }
 } catch (e) {
   fail(`merge-tracker PDF flag sync test crashed: ${e.message}`);
@@ -10433,10 +11836,20 @@ try {
     fail('doctor Playwright MCP guidance is still Claude-specific or lost config detection');
   }
 
+  // doctor also accepts a Playwright MCP server provided by an installed Claude
+  // Code plugin, which lives in the user's config dir rather than the --target
+  // project (#2752). Pin CLAUDE_CONFIG_DIR at an empty dir so these assertions
+  // describe the fixture and not whichever plugins the developer happens to
+  // have enabled; without it "no MCP config" is false on a real machine and the
+  // warning assertion below fails. Same reasoning as the GIT_CONFIG_* pinning
+  // in section 12c.
+  const emptyClaudeCfg = mkdtempSync(join(tmpdir(), 'co-emptycfg-'));
+  const doctorEnv = { env: { ...process.env, CLAUDE_CONFIG_DIR: emptyClaudeCfg } };
+
   // No project MCP config → doctor surfaces a (non-fatal) warning instead of
   // letting SPA job boards fail silently.
   const noMcp = mkdtempSync(join(tmpdir(), 'co-nomcp-'));
-  const a = JSON.parse(run(NODE, ['doctor.mjs', '--json', '--target', noMcp]) || '{}');
+  const a = JSON.parse(run(NODE, ['doctor.mjs', '--json', '--target', noMcp], doctorEnv) || '{}');
   if (Array.isArray(a.warnings) && a.warnings.some((w) => /playwright mcp/i.test(w))) {
     pass('No Playwright MCP config → warning surfaced');
   } else {
@@ -10451,7 +11864,7 @@ try {
     join(withMcp, '.claude', 'settings.json'),
     JSON.stringify({ mcpServers: { playwright: { command: 'npx', args: ['@playwright/mcp', '--headless'] } } }),
   );
-  const b = JSON.parse(run(NODE, ['doctor.mjs', '--json', '--target', withMcp]) || '{}');
+  const b = JSON.parse(run(NODE, ['doctor.mjs', '--json', '--target', withMcp], doctorEnv) || '{}');
   if (Array.isArray(b.warnings) && !b.warnings.some((w) => /playwright mcp/i.test(w))) {
     pass('Playwright MCP configured → no warning');
   } else {
@@ -10466,13 +11879,14 @@ try {
     join(withLocalMcp, '.claude', 'settings.local.json'),
     JSON.stringify({ mcpServers: { browser: { command: 'npx', args: ['@playwright/mcp'] } } }),
   );
-  const c = JSON.parse(run(NODE, ['doctor.mjs', '--json', '--target', withLocalMcp]) || '{}');
+  const c = JSON.parse(run(NODE, ['doctor.mjs', '--json', '--target', withLocalMcp], doctorEnv) || '{}');
   if (Array.isArray(c.warnings) && !c.warnings.some((w) => /playwright mcp/i.test(w))) {
     pass('Playwright MCP configured via .claude/settings.local.json → no warning');
   } else {
     fail(`Did not expect a Playwright MCP warning for settings.local.json, got: ${JSON.stringify(c.warnings)}`);
   }
   rmSync(withLocalMcp, { recursive: true, force: true });
+  rmSync(emptyClaudeCfg, { recursive: true, force: true });
 } catch (e) {
   fail(`Playwright MCP detection test crashed: ${e.message}`);
 }
@@ -12726,6 +14140,37 @@ try {
     fail(`match-star scorer: exact tag match regressed (expected 3, got ${leadershipExactTag})`);
   }
 
+  // Non-Latin story banks (#2847). tokenize() stripped [^a-z0-9\s], so a story
+  // written in Russian or Hindi produced [] and scored 0 against a question in
+  // the SAME language — the matcher was inert, not degraded, for anyone whose
+  // language.output is not English.
+  {
+    const mk = (title, theme, action, result, tags = []) => ({ title, theme, action, result, tags });
+    const ru = mk('\u041C\u0438\u0433\u0440\u0430\u0446\u0438\u044F \u043F\u043B\u0430\u0442\u0435\u0436\u0435\u0439', '\u043F\u043B\u0430\u0442\u0435\u0436\u0438', '\u0412\u043E\u0437\u0433\u043B\u0430\u0432\u0438\u043B \u043C\u0438\u0433\u0440\u0430\u0446\u0438\u044E \u043F\u043B\u0430\u0442\u0451\u0436\u043D\u043E\u0439 \u043F\u043B\u0430\u0442\u0444\u043E\u0440\u043C\u044B', '\u0421\u043D\u0438\u0437\u0438\u043B \u043E\u0442\u043A\u0430\u0437\u044B', ['\u043F\u043B\u0430\u0442\u0435\u0436\u0438']);
+    const hi = mk('\u092D\u0941\u0917\u0924\u093E\u0928 \u092E\u093E\u0907\u0917\u094D\u0930\u0947\u0936\u0928', '\u092D\u0941\u0917\u0924\u093E\u0928', '\u092D\u0941\u0917\u0924\u093E\u0928 \u092E\u093E\u0907\u0917\u094D\u0930\u0947\u0936\u0928 \u0915\u093E \u0928\u0947\u0924\u0943\u0924\u094D\u0935', '\u0935\u093F\u092B\u0932\u0924\u093E\u090F\u0902 \u0918\u091F\u093E\u0908\u0902', ['\u092D\u0941\u0917\u0924\u093E\u0928']);
+
+    const ruTokens = tokenize('\u0420\u0430\u0441\u0441\u043A\u0430\u0436\u0438\u0442\u0435 \u043E \u043C\u0438\u0433\u0440\u0430\u0446\u0438\u0438 \u043F\u043B\u0430\u0442\u0435\u0436\u0435\u0439');
+    const hiTokens = tokenize('\u092E\u0941\u091D\u0947 \u092D\u0941\u0917\u0924\u093E\u0928 \u092E\u093E\u0907\u0917\u094D\u0930\u0947\u0936\u0928 \u0915\u0947 \u092C\u093E\u0930\u0947 \u092E\u0947\u0902 \u092C\u0924\u093E\u090F\u0902');
+
+    tokenize('\u041C\u0438\u0433\u0440\u0430\u0446\u0438\u044F').length > 0 && tokenize('\u092D\u0941\u0917\u0924\u093E\u0928').length > 0
+      ? pass('match-star: non-Latin text produces tokens (#2847)')
+      : fail('match-star: non-Latin text still tokenizes to nothing');
+
+    score(ru, ruTokens, []) > 0 && score(hi, hiTokens, []) > 0
+      ? pass('match-star: a story matches a question in its own language (#2847)')
+      : fail(`match-star: same-language match still scores 0 (ru=${score(ru, ruTokens, [])}, hi=${score(hi, hiTokens, [])})`);
+
+    // The widening must not make everything match everything.
+    score(ru, tokenize('\u0420\u0430\u0441\u0441\u043A\u0430\u0436\u0438\u0442\u0435 \u043E \u043D\u0430\u0439\u043C\u0435 \u043A\u043E\u043C\u0430\u043D\u0434\u044B'), []) === 0
+      ? pass('match-star: an unrelated same-language question still scores 0 (#2847)')
+      : fail('match-star: widening made an unrelated question match');
+
+    // Devanagari matras must survive; without \p{M} they become spaces.
+    tokenize('\u092D\u0941\u0917\u0924\u093E\u0928')[0] === '\u092D\u0941\u0917\u0924\u093E\u0928'
+      ? pass('match-star: Devanagari matras survive tokenization (#2847)')
+      : fail(`match-star: matras stripped — token came back as ${JSON.stringify(tokenize('\u092D\u0941\u0917\u0924\u093E\u0928'))}`);
+  }
+
   // match-star.mjs file must exist (existsSync-guarded in the script itself)
   if (existsSync(join(ROOT, 'match-star.mjs'))) {
     pass('match-star.mjs: file present in repo root');
@@ -12947,9 +14392,8 @@ try {
     { file: 'web/src/app/actions/registry.ts', re: /TAB_VALUES\s*=\s*\[([\s\S]*?)\]/, upper: true, exclude: [] },
     { file: 'web/src/components/pipeline-view.tsx', re: /TABS\s*=\s*\[([\s\S]*?)\]/, upper: true, exclude: [] },
     { file: 'web/src/app/analytics/page.tsx', re: /STAGES[^=]*=\s*\[([\s\S]*?)\];/, upper: true, exclude: ['SKIP'] },
-    // 55.3b+ the degraded-path FALLBACK in the states ACL (career-ops-ui's find, #2282):
-    // it promises to mirror states.yml and drifted to 8 states while the live path had 9.
-    { file: 'web/src/lib/core/states.ts', re: /const FALLBACK[^=]*=\s*\[([\s\S]*?)\n\];/, upper: false, exclude: [] },
+    // The states ACL used to be checked here too. It moved to its own block
+    // below, because it now has TWO valid shapes and this table only knows one.
   ];
   if (stateLabels.length > 0) {
     const drift = [];
@@ -12966,6 +14410,48 @@ try {
       pass('every web status list covers all canonical states from states.yml (#2249)');
     } else {
       fail(`web status list(s) missing canonical state(s) — dashboard can't set/count them (#2249): ${drift.join(' | ')}`);
+    }
+
+    // 55.3b+ the degraded-path FALLBACK in the states ACL (career-ops-ui's
+    // find, #2282). It promised to mirror states.yml, drifted to 8 states
+    // while the live path had 9, and later to 31 missing aliases (#2705).
+    //
+    // TWO shapes are correct and this asserts both, because the earlier
+    // version asserted only the first and therefore turned a genuine
+    // improvement into a red build: either (a) the literal table is present
+    // and complete, or (b) there is NO table because the fallback derives
+    // from CANONICAL_STATES, which the check above already freezes against
+    // states.yml. Deriving from something already frozen beats guarding a
+    // copy — the copy you delete cannot drift.
+    //
+    // The shape that must never pass is a literal table that is INCOMPLETE.
+    // That is the only one that fails silently: a state missing from the
+    // fallback reads exactly like a state the product does not have.
+    const aclPath = join(ROOT, 'web', 'src', 'lib', 'core', 'states.ts');
+    if (existsSync(aclPath)) {
+      const aclSrc = readFileSync(aclPath, 'utf-8');
+      const literal = aclSrc.match(/const FALLBACK[^=]*=\s*\[([\s\S]*?)\n\];/)?.[1];
+      if (literal !== undefined) {
+        const present = new Set([...literal.matchAll(/"([A-Za-z]+)"/g)].map((m) => m[1]));
+        const missing = stateLabels.filter((l) => !present.has(l));
+        if (missing.length) {
+          fail(`states ACL FALLBACK is missing canonical state(s) it claims to mirror (#2282): ${missing.join(', ')}`);
+        } else {
+          pass('states ACL FALLBACK carries every canonical state (#2282)');
+        }
+        // Assert the ASSIGNMENT, not the appearance of the name. `/CANONICAL_STATES/`
+        // over the whole file was satisfied by the header COMMENT, i.e. by prose,
+        // and worse: the literal regex above is a brittle syntactic match (that
+        // exact name, that exact shape), so routing its miss here flipped its
+        // failure direction from red to green. A reformat or a rename would have
+        // passed silently with seven states unaccounted for. A future legitimate
+        // form (`= buildFrom(CANONICAL_STATES)`) fails this on purpose: widening
+        // the guard should be a decision, not a silence. (career-ops-ui's find.)
+      } else if (/const FALLBACK[^=]*=\s*CANONICAL_STATES\b/.test(aclSrc)) {
+        pass('states ACL fallback derives from the frozen CANONICAL_STATES instead of copying states.yml (#2282)');
+      } else {
+        fail('states ACL has neither a complete FALLBACK table nor a derivation from CANONICAL_STATES — the degraded path can now drift unwatched (#2282)');
+      }
     }
 
     // The assistant preamble also enumerates the states in PROSE (the setStatus
@@ -13344,6 +14830,41 @@ try {
           pass(`web company-key mirror matches the core on all ${inputs.length} corpus cases x2 separators (#2666)`);
         } else {
           fail(`web company-key mirror DRIFTED from the core — ${drift.length} case(s): ${drift.slice(0, 3).join(' | ')}`);
+        }
+
+        // 55.7b PAIR SEMANTICS — what parity alone cannot see.
+        // The comparison above proves core and mirror AGREE. It says nothing
+        // about whether they agree on the RIGHT answer: two identical wrong
+        // implementations pass it silently. That is not hypothetical — on
+        // 12-ago the Turkish dotted-I fix shipped as NFD → strip U+0307 → NFC,
+        // which also decomposed the PRECOMPOSED dots of ż, ė and ġ and
+        // collapsed Żubr/Zubr, Ėmė/Eme and Ġenerali/Generali. Both sides were
+        // equally wrong, so parity stayed green and the corpus (which had no
+        // dotted-letter case) could not fail either. Polish, Lithuanian and
+        // Maltese employers silently became one key with their ASCII spelling.
+        // These assertions fix the OUTCOME, not the implementation.
+        const pairs = [
+          // [a, b, mustMatch, why]
+          ['İstanbul Tekstil', 'Istanbul Tekstil', true, 'Turkish dotted capital: the dot is an artifact of toLowerCase, not typed'],
+          ['Türk İlaç', 'Türk Ilaç', true, 'same artifact mid-word'],
+          ['Żubr', 'Zubr', false, 'Polish ż: the dot is a letter the user typed'],
+          ['Ėmė', 'Eme', false, 'Lithuanian ė: same class as ż'],
+          ['Ġenerali', 'Generali', false, 'Maltese ġ, and Generali is a different real company'],
+          ['Škoda', 'Skoda', false, 'the original collision this key exists to prevent'],
+          ['Nestlé', 'Nestle', false, 'accent typed by the user'],
+          ['İŞ BANKASI', 'Is Bankasi', false, 'Ş is a different letter, not a casing artifact'],
+        ];
+        const wrong = [];
+        for (const [a, b, mustMatch, why] of pairs) {
+          const matched = coreFn(a, '') === coreFn(b, '');
+          if (matched !== mustMatch) {
+            wrong.push(`${JSON.stringify(a)} vs ${JSON.stringify(b)}: ${matched ? 'match' : 'differ'}, expected ${mustMatch ? 'match' : 'differ'} (${why})`);
+          }
+        }
+        if (wrong.length === 0) {
+          pass(`company-key pair semantics hold on all ${pairs.length} pairs (casing artifacts fold, typed marks do not)`);
+        } else {
+          fail(`company-key pair semantics BROKEN — ${wrong.length}: ${wrong.slice(0, 3).join(' | ')}`);
         }
         // Guard of the guard, in TWO directions, because each covers a hole the
         // other cannot see:

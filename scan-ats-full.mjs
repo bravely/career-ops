@@ -34,7 +34,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, renameSyn
 import { pathToFileURL } from 'url';
 import { createHash } from 'crypto';
 import path from 'path';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 
 import { makeHttpCtx, fetchJson } from './providers/_http.mjs';
 import { isResolverFailure, dnsPacingStats } from './providers/_dns-cache.mjs';
@@ -46,6 +46,7 @@ import icims from './providers/icims.mjs';
 import { buildTitleFilter, buildLocationFilter, buildContentFilter, matchedTitleKeywords, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, loadBlacklist, parseSinceDays } from './scan.mjs';
 import { SEED_SOURCES, toPortalEntry } from './seeds/vc-portfolios.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
+import { validateFlags } from './lib/cli-flags.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -60,7 +61,21 @@ const CACHE_TTL_HOURS = 24;
 // careers_url and drops anything that doesn't resolve to the ATS's own host —
 // so a tampered dataset can at worst name boards that don't exist.
 const DATASET_BASE = 'https://raw.githubusercontent.com/Feashliaa/job-board-aggregator/main/data';
+
+// Default fan-out. Correct for sources whose boards each live on their OWN
+// host — workday is {tenant}.{instance}.myworkdayjobs.com, so 20 in flight is
+// 20 different servers and the resolver, not any one vendor, is the limit.
 const CONCURRENCY = 20;
+
+// Greenhouse, Lever and Ashby each serve their ENTIRE directory from a single
+// hostname (boards-api.greenhouse.io, api.lever.co, api.ashbyhq.com), so the
+// default is 20 sustained connections to ONE API across thousands of boards.
+// That earns an HTTP throttle, and a throttled sweep loses live boards rather
+// than failing loudly: two full sweeps an hour apart saw lever's unreachable
+// count go 2,436 -> 4,100 and ashby's 683 -> 1,675, then recover to 2,525 / 684
+// after a cooldown with no change to the dataset. The boards were never dead —
+// they were refused, and the matches on them were silently missed.
+const SINGLE_HOST_CONCURRENCY = 6;
 // A refusing resolver fails every lookup in milliseconds, so a sweep that
 // keeps going just feeds it (#2229). Stop after this many consecutive
 // resolver-level failures — high enough that a handful of unlucky boards
@@ -156,6 +171,8 @@ export function entryOnHost(name, careersUrl, isCanonicalHost) {
 export const SOURCES = {
   greenhouse: {
     provider: greenhouse,
+    // Whole directory behind one host — see SINGLE_HOST_CONCURRENCY.
+    concurrency: SINGLE_HOST_CONCURRENCY,
     dataset: `${DATASET_BASE}/greenhouse_companies.json`,
     toEntry: (slug) => SLUG_RE.test(String(slug))
       ? entryOnHost(String(slug), `https://job-boards.greenhouse.io/${slug}`, h => h === 'job-boards.greenhouse.io')
@@ -163,6 +180,8 @@ export const SOURCES = {
   },
   lever: {
     provider: lever,
+    // Whole directory behind one host — see SINGLE_HOST_CONCURRENCY.
+    concurrency: SINGLE_HOST_CONCURRENCY,
     dataset: `${DATASET_BASE}/lever_companies.json`,
     toEntry: (slug) => SLUG_RE.test(String(slug))
       ? entryOnHost(String(slug), `https://jobs.lever.co/${slug}`, h => h === 'jobs.lever.co')
@@ -170,6 +189,8 @@ export const SOURCES = {
   },
   ashby: {
     provider: ashby,
+    // Whole directory behind one host — see SINGLE_HOST_CONCURRENCY.
+    concurrency: SINGLE_HOST_CONCURRENCY,
     dataset: `${DATASET_BASE}/ashby_companies.json`,
     toEntry: (slug) => SLUG_RE.test(String(slug))
       ? entryOnHost(String(slug), `https://jobs.ashbyhq.com/${slug}`, h => h === 'jobs.ashbyhq.com')
@@ -226,28 +247,13 @@ const USAGE = `Usage:
 function parseArgs(argv) {
   const args = argv.slice(2);
 
-  if (args.includes('--help') || args.includes('-h')) {
-    console.log(USAGE);
-    process.exit(0);
-  }
-
-  // A value-taking flag's space-separated value (e.g. the `-tmp` in
-  // `--md-out -tmp`) must not be mistaken for an unrecognized flag just
-  // because it happens to start with `-`. Mirrors valueOf()'s own adjacency
-  // rule below so `--flag value` and `--flag=value` are validated consistently.
-  const consumedValueIndices = new Set();
-  args.forEach((a, idx) => {
-    if (VALUE_FLAGS.includes(a) && args[idx + 1] !== undefined && !args[idx + 1].startsWith('--')) {
-      consumedValueIndices.add(idx + 1);
-    }
-  });
-
-  const unknownFlags = args.filter((a, idx) =>
-    a.startsWith('-') && !consumedValueIndices.has(idx) && !KNOWN_FLAGS.includes(a.split('=')[0]));
-  if (unknownFlags.length) {
-    console.error(`Error: unrecognized flag(s): ${unknownFlags.join(', ')}. Valid flags: ${KNOWN_FLAGS.join(', ')}`);
-    process.exit(1);
-  }
+  // Shared with reply-watch.mjs/dedup-tracker.mjs/scan.mjs via
+  // lib/cli-flags.mjs (#2775). This also fixes a latent ordering bug this
+  // script had before the pattern was consolidated: the unrecognized-flag
+  // check now runs BEFORE --help, so `--help --bogus` still errors instead
+  // of exiting 0 having never looked at `--bogus` (the same ordering
+  // CodeRabbit flagged on #2745/#2746).
+  validateFlags(args, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS });
 
   const valueOf = (flag) => {
     const idx = args.indexOf(flag);
@@ -641,7 +647,14 @@ async function main() {
   // sinceMs once postings are confidently past the --since window, and
   // includeUndated (when false) for a tenant that exposes no postedOn at
   // all, since its postings would all be dropped as undated below anyway.
-  const ctx = { ...makeHttpCtx(), sinceMs: cutoff, includeUndated: opts.includeUndated };
+  //
+  // syntheticEntries states what this scanner's entries ARE: built from the
+  // external ATS dataset, not read from portals.yml tracked_companies.
+  // workday.mjs picks its cap-hit warning from it — there is no portal entry
+  // here for the user to edit, so "raise max_pages on this entry" would be
+  // inactionable. It used to infer that from sinceMs being set, which stopped
+  // being true once #2418 taught scan.mjs --since to set it too (#2495).
+  const ctx = { ...makeHttpCtx(), sinceMs: cutoff, includeUndated: opts.includeUndated, syntheticEntries: true };
   const date = new Date().toISOString().slice(0, 10);
 
   // Same defensive default as completedSources/counters below: a version-1
@@ -780,7 +793,7 @@ async function main() {
     let lastDone = 0;
     let lastResumeAt = 0;
     const truncated = [];
-    await parallelEach(entries, CONCURRENCY, async (entry) => {
+    await parallelEach(entries, source.concurrency ?? CONCURRENCY, async (entry) => {
       try {
         // The whole per-company unit — fetch AND processJobs (which may issue
         // per-job detail-page requests via provider.enrichDate) — runs inside
@@ -972,7 +985,7 @@ async function main() {
       writeFileSync(PIPELINE_PATH, '# Pipeline\n\n## Pendientes\n', 'utf-8');
     }
     await appendToPipeline(offers);
-    appendToScanHistory(offers, date);
+    await appendToScanHistory(offers, date);
     saved = true;
     log(`\nResults saved to ${PIPELINE_PATH} and data/scan-history.tsv`);
 
