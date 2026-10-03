@@ -10,6 +10,7 @@
  *   node update-system.mjs check      # Check if a newer release is published
  *                                     # (merges to main between releases
  *                                     # never prompt; see checkStatus())
+ *   node update-system.mjs status     # Print installed version (with short SHA)
  *   node update-system.mjs check --force
  *                                     # …even for a release the user dismissed
  *   node update-system.mjs apply --confirm
@@ -153,6 +154,7 @@ const SYSTEM_PATHS = [
   'modes/_brief.template.md',
   'voice-dna.template.md',
   'modes/oferta.md',
+  'modes/master-profile.md',
   'modes/pdf.md',
   'modes/ats.md',
   'modes/text.md',
@@ -209,7 +211,9 @@ const SYSTEM_PATHS = [
   'modes/it/',
   'modes/it/interview/',
   'modes/ja/',
+  'modes/ja/interview/',
   'modes/ko/',
+  'modes/ko/interview/',
   'modes/nl/',
   'modes/pl/',
   'modes/pt/',
@@ -232,6 +236,7 @@ const SYSTEM_PATHS = [
   'KIMI.md',
   'build-dashboard.mjs',
   'clean-markers.mjs',
+  'cv-experience-order.mjs',
   'generate-pdf.mjs',
   'hired-share.mjs',
   'hired-wall-build.mjs',
@@ -249,6 +254,7 @@ const SYSTEM_PATHS = [
   'lib/scan-summary-marker.mjs',
   'lib/is-main-module.mjs',
   'lib/mjs-files.mjs',
+  'lib/scratch-dirs.mjs',
   'lib/outcome-dir.mjs',
   'lib/outcome-types.mjs',
   'lib/latex-escape.mjs',
@@ -298,6 +304,7 @@ const SYSTEM_PATHS = [
 
   'reserve-report-num.mjs',
   'scan.mjs',
+  'migrate-scan-runs.mjs',
   'pipeline-lock.mjs',
   'portal-health-lock.mjs',
   'classify-tier.mjs',
@@ -306,6 +313,7 @@ const SYSTEM_PATHS = [
   'company-funded.mjs',
   'match-star.mjs',
   'jd-skill-gap.mjs',
+  'career-profile.mjs',
   'prepare-application.mjs',
   'application-artifacts.mjs',
   'batch-evaluate-gemini.mjs',
@@ -323,6 +331,7 @@ const SYSTEM_PATHS = [
   'browser-extract.mjs',
   'fetch-jd.mjs',
   'analyze-patterns.mjs',
+  'keyword-match.mjs',
   'calibrate.mjs',
   'upskill.mjs',
   'skill-extract.mjs',
@@ -331,6 +340,7 @@ const SYSTEM_PATHS = [
   'detect-reposts.mjs',
   'rank-pipeline.mjs',
   'discover-ats.mjs',
+  'discover-new-companies.mjs',
   'check-table-freshness.mjs',
   'check-jd-archive.mjs',
   'fingerprint-core.mjs',
@@ -365,6 +375,7 @@ const SYSTEM_PATHS = [
   'tracker-writer-lock-tests.mjs',
   'agent-inbox-tests.mjs',
   'validate-portals.mjs',
+  'validate-profile.mjs',
   'verify-portals.mjs',
   'audit-portals.mjs',
   'fix-slugs.mjs',
@@ -463,6 +474,7 @@ const SYSTEM_PATHS = [
   'LICENSE',
   'CITATION.cff',
   'funding.json',
+  '.well-known/',
   '.editorconfig',
   '.github/',
   'package.json',
@@ -697,9 +709,28 @@ function parseVersionFile(raw) {
   return raw.trim().split(/\s+/)[0] || '';
 }
 
-function localVersion() {
-  const vPath = join(ROOT, 'VERSION');
+function localShortSha(root = ROOT) {
+  if (gitToplevelMismatch(root)) return '';
+  try {
+    return gitQuietIn(root, 'rev-parse', '--short', 'HEAD') || '';
+  } catch {
+    return '';
+  }
+}
+
+function formatVersionWithSha(version, sha) {
+  return sha ? `${version} (${sha})` : version;
+}
+
+function localVersion(root = ROOT) {
+  const vPath = join(root, 'VERSION');
   return existsSync(vPath) ? parseVersionFile(readFileSync(vPath, 'utf-8')) : '0.0.0';
+}
+
+export function formatLocalVersion(root = ROOT) {
+  const version = localVersion(root);
+  const sha = localShortSha(root);
+  return formatVersionWithSha(version, sha);
 }
 
 function compareVersions(a, b) {
@@ -818,11 +849,11 @@ function git(...args) {
  * @param {...string} args - git arguments.
  * @returns {string} Trimmed stdout.
  */
-function gitQuiet(...args) {
+export function gitQuietIn(root, ...args) {
   const timeout = gitTimeoutMs(args);
   try {
     return execFileSync('git', args, {
-      cwd: ROOT, encoding: 'utf-8', timeout, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: root, encoding: 'utf-8', timeout, stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
   } catch (err) {
     if (isTimeoutLikeError(err)) {
@@ -830,6 +861,10 @@ function gitQuiet(...args) {
     }
     throw err;
   }
+}
+
+function gitQuiet(...args) {
+  return gitQuietIn(ROOT, ...args);
 }
 
 /**
@@ -854,7 +889,7 @@ function gitQuiet(...args) {
 export function gitToplevelMismatch(root = ROOT) {
   let toplevel;
   try {
-    toplevel = gitIn(root, 'rev-parse', '--show-toplevel');
+    toplevel = gitQuietIn(root, 'rev-parse', '--show-toplevel');
   } catch {
     return null;
   }
@@ -1422,39 +1457,35 @@ export function locallyModifiedSystemFiles(paths, upstreamRef = 'FETCH_HEAD', ct
  * preserved by definition — the match IS the file's only content, so no
  * upstream lookup can add information. Only a directory `path` needs the
  * upstream ls-tree lookup, to confirm EVERY file it would check out is
- * preserved; an unreadable lookup degrades to "not fully preserved" so the
- * real checkout runs and reports its own diagnostics, same contract as
- * `locallyModifiedSystemFiles`.
+ * preserved.
  *
- * Two limits are deliberate, both raised in review of #3781:
+ * Tri-state, because for a directory the ls-tree lookup can fail and `false`
+ * would then mean two different things (#3824):
  *
- * 1. The single-file shortcut diverges from the pre-extraction inline check
- *    for a preserved file ABSENT from FETCH_HEAD. That check fell through to
- *    the real checkout, which failed and put the path in apply()'s "Skipped
- *    N path(s) absent upstream" summary; this returns true and skips it
- *    silently. Unreachable while preserved paths come from
- *    `locallyModifiedSystemFiles`, which only reports files that exist
- *    upstream (it gates each candidate on `cat-file -e <ref>:<file>`), so
- *    nothing today can construct the case — but it is a real divergence, not
- *    a behaviour-preserving one, and a future caller sourcing preservedPaths
- *    some other way would hit it.
+ *   - `true`    — nothing is left to check out; apply() skips the entry.
+ *   - `false`   — real upstream content is not preserved; apply() checks it
+ *                 out and any error it hits is a genuine failure.
+ *   - `'unknown'` — the directory's upstream content could not be enumerated
+ *                 (unreadable ls-tree). apply() still checks it out, but a
+ *                 "did not match any file(s)" cancel-out error is then benign:
+ *                 the directory may in fact have been fully preserved, and
+ *                 that is not distinguishable here from a real failure without
+ *                 matching git's stderr at the call site.
  *
- * 2. The directory branch's `catch → false` does NOT close the cancel-out
- *    abort for directories. A throwing ls-tree still falls through to
- *    `git checkout FETCH_HEAD -- modes/ :(exclude)modes/pdf.md`, which
- *    aborts the update when the directory happens to be fully preserved.
- *    That is exactly the pre-extraction behaviour, carried over unchanged —
- *    this function makes the check testable and drops a redundant lookup for
- *    the single-file case; it does not fix the directory case. Closing it
- *    needs a tri-state result whose "unknown" makes the checkout's "did not
- *    match any file(s)" benign at the call site; tracked separately rather
- *    than folded in here, since that means matching on git's stderr text.
+ * One limit is deliberate, raised in review of #3781: the single-file
+ * shortcut diverges from the pre-extraction inline check for a preserved file
+ * ABSENT from FETCH_HEAD (that check fell through to the real checkout and
+ * listed the path in apply()'s "Skipped N path(s) absent upstream" summary;
+ * this returns true and skips it silently). Unreachable while preserved paths
+ * come from `locallyModifiedSystemFiles`, which only reports files that exist
+ * upstream, but a future caller sourcing preservedPaths another way would hit
+ * it.
  *
  * @param {string} path - a SYSTEM_PATHS entry, file or `dir/`-suffixed directory.
  * @param {string[]} preservedPaths - files this run is keeping local content for.
  * @param {Set<string>} preservedSet - the same paths, as a Set, for lookup.
  * @param {{git?: Function}} [ctx] - injection point for tests; defaults to gitQuiet.
- * @returns {boolean}
+ * @returns {boolean | 'unknown'}
  */
 export function pathFullyPreserved(path, preservedPaths, preservedSet, ctx = {}) {
   if (preservedSet.size === 0) return false;
@@ -1468,9 +1499,75 @@ export function pathFullyPreserved(path, preservedPaths, preservedSet, ctx = {})
     upstreamFiles = runGitQuiet('ls-tree', '-r', '--name-only', 'FETCH_HEAD', '--', path)
       .split('\n').map((f) => f.trim()).filter(Boolean);
   } catch {
-    return false;
+    // Can't enumerate the directory's upstream content: it might be fully
+    // preserved (skip) or not (check out). The call site checks it out and
+    // treats a cancel-out error as benign — see checkoutErrorIsBenign.
+    return 'unknown';
   }
   return upstreamFiles.length > 0 && upstreamFiles.every((f) => preservedSet.has(f));
+}
+
+// git's pathspec cancel-out message. `git checkout <ref> -- <dir>/ :(exclude)…`
+// prints `error: pathspec '<dir>/' did not match any file(s) known to git` when
+// the exclusions leave nothing to check out. Match loosely: the wording has
+// been stable for years but the quoting and the "known to git" tail vary.
+const PATHSPEC_CANCELLED_RE = /did not match any file/i;
+
+/**
+ * Whether a checkout error thrown inside apply()'s per-path loop is a benign
+ * skip rather than a real failure that must abort the update.
+ *
+ * Two benign shapes:
+ *   - `absentUpstream` — the path is genuinely gone from FETCH_HEAD (a stale
+ *     SYSTEM_PATHS entry such as an old `.gemini/commands/` directory).
+ *   - a `pathFullyPreserved` result of `'unknown'` paired with git's pathspec
+ *     cancel-out message — the directory's upstream content could not be
+ *     enumerated up front, the exclusion pathspecs cancelled the whole
+ *     checkout out, and nothing was left to install (#3824).
+ *
+ * Anything else — timeouts, permission errors, repo corruption — is a real
+ * failure and is rethrown by the caller.
+ *
+ * @param {unknown} err - the error execFileSync threw.
+ * @param {{absentUpstream: boolean, preservedState: boolean | 'unknown'}} opts
+ * @returns {boolean}
+ */
+export function checkoutErrorIsBenign(err, { absentUpstream, preservedState }) {
+  // absentUpstream/preservedState prove WHY a checkout of this path would
+  // legitimately have nothing to check out — they say nothing about whether
+  // THIS error is that. Requiring git's own pathspec-cancellation message
+  // first (CodeRabbit, #3955) means an absent path with an unrelated real
+  // failure — a corrupted index, a permissions error, a timeout — still
+  // rethrows instead of being swallowed just because the path happens to be
+  // gone from FETCH_HEAD too.
+  const text = `${(err && err.stderr) || ''}\n${(err && err.message) || ''}`;
+  if (!PATHSPEC_CANCELLED_RE.test(text)) return false;
+  return absentUpstream || preservedState === 'unknown';
+}
+
+/**
+ * Whether `spec` is absent from FETCH_HEAD's tree — the answer that makes a
+ * checkout failure in apply()'s per-path loop a benign skip rather than a real
+ * error to rethrow (#1998, #3824).
+ *
+ * Only a SUCCESSFUL empty `git ls-tree --name-only FETCH_HEAD -- <spec>` counts:
+ * ls-tree prints the entry when the path is in the tree and nothing when it is
+ * not, both at exit 0. A THROW (bad ref, unreadable repo, timeout) is the probe
+ * failing to run, not an answer — return false so the checkout error rethrows
+ * instead of being masked as a skip. Extracted from apply()'s catch so the
+ * throwing-probe path is testable without running apply() (#3955 review).
+ *
+ * @param {string} spec - path to probe; a `dir/` entry is passed without its trailing slash.
+ * @param {{git?: Function}} [ctx] - injection point for tests; defaults to gitQuiet.
+ * @returns {boolean}
+ */
+export function probeAbsentUpstream(spec, ctx = {}) {
+  const runGitQuiet = ctx.git || gitQuiet;
+  try {
+    return runGitQuiet('ls-tree', '--name-only', 'FETCH_HEAD', '--', spec).trim() === '';
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -2178,22 +2275,23 @@ async function latestRelease(runCurlGet) {
 export async function checkStatus(argv, env, ctx = {}) {
   const runCurlGet = ctx.curlGet || curlGet;
   const local = (ctx.localVersion || localVersion)();
+  const localSha = (ctx.localShortSha || localShortSha)();
   const marker = argv.includes('--force') ? null : parseDismissMarker((ctx.readMarker || readDismissMarker)());
-  if (resolveChannel(argv, env) === 'main') return checkMainChannel(local, marker, runCurlGet);
+  if (resolveChannel(argv, env) === 'main') return checkMainChannel(local, marker, runCurlGet, localSha);
 
   const latest = await latestRelease(runCurlGet);
-  if (latest.status !== 'ok') return { status: latest.status, local, ...(latest.tag ? { tag: latest.tag } : {}) };
+  if (latest.status !== 'ok') return { status: latest.status, local, ...(localSha ? { local_sha: localSha } : {}), ...(latest.tag ? { tag: latest.tag } : {}) };
   const remote = latest.version;
-  if (compareVersions(local, remote) >= 0) return { status: 'up-to-date', local, remote };
-  if (dismissalCovers(marker, remote, latest.publishedAt)) return { status: 'dismissed', local, remote };
-  return { status: 'update-available', local, remote, reason: 'version-changed', changelog: latest.changelog.slice(0, 500) };
+  if (compareVersions(local, remote) >= 0) return { status: 'up-to-date', local, remote, ...(localSha ? { local_sha: localSha } : {}) };
+  if (dismissalCovers(marker, remote, latest.publishedAt)) return { status: 'dismissed', local, remote, ...(localSha ? { local_sha: localSha } : {}) };
+  return { status: 'update-available', local, remote, ...(localSha ? { local_sha: localSha } : {}), reason: 'version-changed', changelog: latest.changelog.slice(0, 500) };
 }
 
 /**
  * check() for `--channel main`: the pre-#3845 logic, unchanged apart from
  * returning its answer and honouring a per-release dismissal.
  */
-async function checkMainChannel(local, marker, runCurlGet) {
+async function checkMainChannel(local, marker, runCurlGet, localSha) {
   let remote = '';
   let releaseVersion = '';
   let changelog = '';
@@ -2253,7 +2351,7 @@ async function checkMainChannel(local, marker, runCurlGet) {
     // empty strings, which still reaches the offline branch — that's the
     // right conservative behaviour (no version = can't determine status).
     const bothNetworkFailed = rawVersion === null && releaseRaw === null;
-    return { status: bothNetworkFailed ? 'offline' : 'no-remote-version', local };
+    return { status: bothNetworkFailed ? 'offline' : 'no-remote-version', local, ...(localSha ? { local_sha: localSha } : {}) };
   }
 
   // Use the higher version between VERSION file and GitHub Release
@@ -2295,13 +2393,13 @@ async function checkMainChannel(local, marker, runCurlGet) {
   }
 
   if (compareVersions(local, remote) >= 0 && !systemTreeDrift) {
-    return { status: 'up-to-date', local, remote, local_commit: localCommit || undefined, remote_commit: remoteCommit || undefined };
+    return { status: 'up-to-date', local, remote, local_commit: localCommit || undefined, ...(localSha ? { local_sha: localSha } : {}), remote_commit: remoteCommit || undefined };
   }
 
   // A "no" to v{remote} (drift at the same version included) holds until a
   // newer version; no release date on this channel, so a legacy timestamp
   // marker keeps covering.
-  if (dismissalCovers(marker, remote, '')) return { status: 'dismissed', local, remote };
+  if (dismissalCovers(marker, remote, '')) return { status: 'dismissed', local, remote, ...(localSha ? { local_sha: localSha } : {}) };
 
   return {
     status: 'update-available',
@@ -2309,6 +2407,7 @@ async function checkMainChannel(local, marker, runCurlGet) {
     remote,
     reason: systemTreeDrift ? 'system-files-changed' : 'version-changed',
     local_commit: localCommit || undefined,
+    ...(localSha ? { local_sha: localSha } : {}),
     remote_commit: remoteCommit || undefined,
     changelog: changelog.slice(0, 500),
   };
@@ -2746,9 +2845,12 @@ async function apply() {
       // `git checkout <ref> -- <path> :(exclude)<path>` errors with "did not
       // match any file(s)" when the exclusions cancel the whole pathspec — and
       // that error is indistinguishable from a genuine failure at the catch
-      // below, so it would abort the entire update. Skip the entry instead when
-      // nothing would be left to check out (see pathFullyPreserved).
-      if (pathFullyPreserved(path, preservedPaths, preservedSet)) continue;
+      // below, so it would abort the entire update. Skip the entry outright
+      // when nothing would be left to check out; when the directory's upstream
+      // content could not be enumerated ('unknown'), still check it out but let
+      // the catch treat a cancel-out error as benign (#3824).
+      const preservedState = pathFullyPreserved(path, preservedPaths, preservedSet);
+      if (preservedState === true) continue;
       try {
         // stderr is piped rather than inherited here. A path absent upstream is
         // an EXPECTED skip (a stale manifest entry such as `.gemini/commands/`),
@@ -2764,11 +2866,13 @@ async function apply() {
         // reported them as skips too — letting a partial update reach the
         // success banner (#1998). Confirm the path is actually absent from
         // FETCH_HEAD before treating the failure as benign; otherwise rethrow.
+        // A fully-preserved directory whose upstream content we could not
+        // enumerate up front ('unknown') is the second benign shape: the
+        // exclusions cancelled the checkout out and git said "did not match
+        // any file(s)" (#3824).
         const spec = path.endsWith('/') ? path.slice(0, -1) : path;
-        let absentUpstream = false;
-        try { gitQuiet('cat-file', '-e', `FETCH_HEAD:${spec}`); }
-        catch { absentUpstream = true; }
-        if (!absentUpstream) throw err;
+        const absentUpstream = probeAbsentUpstream(spec);
+        if (!checkoutErrorIsBenign(err, { absentUpstream, preservedState })) throw err;
         skippedPaths.push(path);
       }
     }
@@ -3291,11 +3395,12 @@ if (isCli) {
   try {
     switch (cmd) {
       case 'check': await check(); break;
+      case 'status': console.log(`career-ops v${formatLocalVersion()}`); break;
       case 'apply': await apply(); break;
       case 'rollback': rollback(); break;
       case 'dismiss': await dismiss(); break;
       default:
-        console.log('Usage: node update-system.mjs [check [--force] [--channel main]|apply --confirm [--force] [--channel main]|rollback|dismiss [--version X.Y.Z]]');
+        console.log('Usage: node update-system.mjs [check [--force] [--channel main]|status|apply --confirm [--force] [--channel main]|rollback|dismiss [--version X.Y.Z]]');
         process.exit(1);
     }
   } catch (err) {

@@ -24,6 +24,7 @@ All scripts live in the project root as `.mjs` modules. Most are exposed via
 | `npm run update:check` | `update-system.mjs check` | Check for a newer published release |
 | `npm run update` | `update-system.mjs apply --confirm` | Apply upstream update |
 | `npm run rollback` | `update-system.mjs rollback` | Rollback last update |
+| `node update-system.mjs status` | `update-system.mjs status` | Print installed version + short SHA |
 | `npm run liveness` | `check-liveness.mjs` | Test if job URLs are still active |
 | `npm run extract` | `browser-extract.mjs` | Headless read-only page extractor (opt-in `scan.extractor: cli`) — compact JSON for scan/JD; Greenhouse, Lever, Ashby and Workday postings are read from their public JSON endpoints instead of the client-rendered page, and an empty jd extraction exits 1 with `code: empty_text` |
 | `node fetch-jd.mjs <url>` | `fetch-jd.mjs` | JD text on stdout from a known ATS API (Greenhouse/Lever/Ashby/Workday) — exit 1 with empty stdout when the host has no JD-bearing API, so a caller falls back to its browser/WebFetch path |
@@ -121,9 +122,17 @@ Merges batch tracker additions (`batch/tracker-additions/*.tsv`) into `applicati
 npm run merge                 # apply merge
 npm run merge -- --dry-run    # preview without writing
 npm run merge -- --verify     # merge then run verify-pipeline
+node merge-tracker.mjs --backfill-urls            # explicitly add/backfill the optional URL column
+node merge-tracker.mjs --backfill-urls --dry-run  # preview the schema migration and fills
 ```
 
 Processed TSVs are moved to `batch/tracker-additions/merged/`.
+
+`--backfill-urls` is an explicit, idempotent migration for legacy trackers. If
+the tracker has no `URL` header, it appends the column and empty cells first,
+then fills URLs that can be resolved from linked report metadata in the same
+atomic write. Unresolvable rows keep an empty URL cell. Normal merges do not
+add the column or otherwise change a legacy tracker's schema.
 
 **Exit codes:** `0` success, `1` verification errors (with `--verify`).
 
@@ -253,7 +262,10 @@ Renders an HTML file to a print-quality, ATS-parseable PDF via headless Chromium
 npm run pdf -- input.html output.pdf
 npm run pdf -- input.html output.pdf --format=letter   # US letter
 npm run pdf -- input.html output.pdf --format=a4        # A4 (default)
+npm run pdf -- input.html output.pdf --allow-nonchronological   # keep a deliberate role order (warns instead of failing)
 ```
+
+Generation fails when the Work Experience entries are not newest-first, and the error quotes the dates of the role that starts later than the one above it. Put the roles back in reverse-chronological order and rerun: tailor a CV through the summary, competencies, and bullet selection, not by moving roles. If the candidate wants a different order, pass `--allow-nonchronological` to turn the failure into a warning. With `--batch`, only the out-of-order CV fails and the rest still render.
 
 **Exit codes:** `0` PDF generated, `1` missing arguments or generation failure.
 
@@ -560,6 +572,32 @@ Possible JSON responses:
 
 `check --force` ignores a dismissal. `check --channel main` keeps the previous behaviour for installs that follow `main`: main's `VERSION` plus system-file drift (`reason: system-files-changed`).
 
+The `local` field in the JSON output stays a bare semver string (e.g., `"1.32.0"`). A separate `local_sha` field is provided alongside it when the install is a git checkout — containing the short commit SHA (e.g., `"ae919b6f"`). For tarball installs without git metadata, `local_sha` will be omitted. This lets a bug report identify the exact tree under test, not just the release name (two installs pulled days apart can share a version string while running different code — see #3203).
+
+**Exit codes:** `0` always.
+
+---
+
+## status
+
+Prints the installed version to stdout — a quick human-readable alternative to parsing `check` JSON.
+
+```bash
+node update-system.mjs status
+```
+
+Example output:
+
+```
+career-ops v1.32.0 (ae919b6f)
+```
+
+On a tarball install with no git metadata the short SHA is omitted:
+
+```
+career-ops v1.32.0
+```
+
 **Exit codes:** `0` always.
 
 ---
@@ -625,11 +663,13 @@ For custom SSR pages, configure a tracked company with `scan_method: local_parse
 ```yaml
 parser:
   command: node
-  script: scripts/parsers/example-company-jobs.js
+  script: local/example-company-jobs.js
   format: jobs-json-v1
 ```
 
 Use `args` only for reusable parsers that intentionally accept runtime parameters such as `{careers_url}` or `{company}`.
+
+The script must resolve inside the repo root (security boundary in `providers/local-parser.mjs`). Keep a private, non-contributed parser under a gitignored path — `local/` is ignored by default — so it is never staged; `portals.yml` itself is already gitignored. Use `scripts/parsers/` only for a parser you intend to upstream. See [local-parser-cookbook.md](local-parser-cookbook.md).
 
 If a parser writes full extraction artifacts for debugging or audit, store them under `data/parser-output/{company}/`. `scan.mjs` reads stdout and does not require those JSON files after parsing. Keep generated JSON artifacts out of git; `.gitkeep` placeholders are the only exception for preserving directory structure.
 
